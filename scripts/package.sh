@@ -1,0 +1,1 @@
+conda pack -n workspace -o workspace.tar.gz --ignore-missing-files

@@ -1,0 +1,16 @@
+*.log
+*.err
+*.npy
+*.npz
+*.tar*
+*.zip
+*.pth
+*.pt
+
+__pycache__/       
+
+outputs/
+multirun/
+.vscode/
+
+commit_messages.txt

@@ -1,0 +1,13 @@
+hydra:
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.override_dirname}
+
+defaults:
+  - _self_
+  - dataset: mkgw
+  - model: kgjepa
+  - exp: train
+
+meta_path: "./data/"
+seed: 2026

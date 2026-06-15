@@ -1,0 +1,10 @@
+_target_: src.model.KGJEPAModel
+
+num_entities: ${dataset.num_entities}
+num_relations: ${dataset.num_relations}
+
+embed_dim: 512
+rank: 16
+layer_types: gat
+layer_kwargs: {}
+pred_dropout: 0.1
