@@ -44,22 +44,19 @@ Architecture overview
   EntityEncoder.fuse_modality(entity_ids, entity_embed, modal_embeds) is the
   designated hook for MMKG.  Override or extend it when text / image
   representations become available.  The rest of the model requires no changes.
-
-File layout
------------
-  gnn.py   – standalone GNN layer definitions (GCNLayer, GATLayer, factory)
-  model.py – this file; imports from gnn.py only
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.gnn import build_gnn_layer, RMSNorm
+from .gnn import build_gnn_layer
+from .norm import RMSNorm
+from .transformer import TransformerBlock
 
 # ===========================================================================
 # 1. Entity Encoder
@@ -67,73 +64,114 @@ from src.gnn import build_gnn_layer, RMSNorm
 
 
 class EntityEncoder(nn.Module):
-    """
-    Assigns a learnable embedding to every entity.
+    """Multimodal Entity Encoder with Text and Vision Fusion."""
 
-    The method ``fuse_modality`` is the designated extension point for MMKG:
-    when text or image representations become available, override (or call
-    super and add to) that method to blend structural and modal embeddings.
-    Currently the method is a no-op pass-through.
-
-    Parameters
-    ----------
-    num_entities : total number of entities in the KG
-    embed_dim    : embedding dimension
-    """
-
-    def __init__(self, num_entities: int, embed_dim: int) -> None:
+    def __init__(
+        self, num_entities: int, embed_dim: int, nhead: int, dropout: float
+    ) -> None:
         super().__init__()
         self.entity_embed = nn.Embedding(num_entities, embed_dim)
 
-    # ------------------------------------------------------------------
-    # Multimodal extension point
-    # ------------------------------------------------------------------
+        # Load pre-trained codebooks: text [30522, 768], vision [8192, 32]
+        text_cb = torch.load("tokens/textual.pth")
+        vis_cb = torch.load("tokens/visual.pth")
 
-    def fuse_modality(
-        self,
-        entity_ids: Tensor,  # [N]
-        entity_embed: Tensor,  # [N, D]
-        modal_embeds: Optional[Tensor] = None,  # [N, D]  text / image
-    ) -> Tensor:  # [N, D]
-        """
-        Fuse structural entity embeddings with optional modal representations.
+        self.text_embed = nn.Embedding.from_pretrained(text_cb, freeze=True)
+        self.vis_embed = nn.Embedding.from_pretrained(vis_cb, freeze=True)
 
-        Current behaviour (no modality): identity — returns ``entity_embed``
-        unchanged.
+        # Project each codebook's native dim to shared embed_dim
+        self.text_proj = nn.Linear(768, embed_dim)
+        self.vis_proj = nn.Linear(32, embed_dim)
 
-        Override this method (or replace this module) to implement multimodal
-        fusion strategies, for example:
-          - simple addition or gating
-          - cross-attention between structural and modal tokens
-          - MLP-based projection and fusion
-
-        Parameters
-        ----------
-        entity_ids   : entity indices (may be used to look up per-entity
-                       cached modal embeddings in a future implementation)
-        entity_embed : structural embeddings from ``self.entity_embed``
-        modal_embeds : pre-computed text or image representations;
-                       ``None`` when running in unimodal mode
-        """
-        if modal_embeds is None:
-            return entity_embed
-        # ----------------------------------------------------------------
-        # TODO (MMKG): implement fusion, e.g.
-        #   gate = torch.sigmoid(self.fusion_gate(entity_embed))
-        #   return gate * entity_embed + (1 - gate) * modal_embeds
-        # ----------------------------------------------------------------
-        raise NotImplementedError(
-            "fuse_modality: modal_embeds supplied but fusion is not yet "
-            "implemented.  Override this method to add multimodal support."
+        # Unimodal self-attention encoders
+        self.text_encoder = TransformerBlock(
+            in_dim=embed_dim, nhead=nhead, dropout=dropout
         )
+        self.vis_encoder = TransformerBlock(
+            in_dim=embed_dim, nhead=nhead, dropout=dropout
+        )
+
+        # Cross-attention: entity embedding attends over multimodal context
+        self.fusion_decoder = TransformerBlock(
+            in_dim=embed_dim, nhead=nhead, dropout=dropout
+        )
+
+    def _encode_vis(self, vis_tokens: Tensor) -> tuple[Tensor, Tensor]:
+        pad_mask = vis_tokens != -1  # [B, L_v]
+        tokens = vis_tokens.masked_fill(~pad_mask, 0)
+        emb = self.vis_proj(self.vis_embed(tokens))  # [B, L_v, D]
+
+        valid_samples = pad_mask.any(dim=1)  # [B]
+
+        if valid_samples.all():
+            return self.vis_encoder(emb, is_causal=False, mask=pad_mask), pad_mask
+
+        out = torch.zeros_like(emb)  # [B, L_v, D]
+        if valid_samples.any():
+            out[valid_samples] = self.vis_encoder(
+                emb[valid_samples],
+                is_causal=False,
+                mask=pad_mask[valid_samples],
+            )
+
+        return out, pad_mask
+
+    def _encode_text(self, text_tokens: Tensor) -> tuple[Tensor, Tensor]:
+        pad_mask = text_tokens != -1
+        tokens = text_tokens.masked_fill(~pad_mask, 0)
+        emb = self.text_proj(self.text_embed(tokens))
+
+        valid_samples = pad_mask.any(dim=1)
+
+        if valid_samples.all():
+            return self.text_encoder(emb, is_causal=False, mask=pad_mask), pad_mask
+
+        out = torch.zeros_like(emb)
+        if valid_samples.any():
+            out[valid_samples] = self.text_encoder(
+                emb[valid_samples],
+                is_causal=False,
+                mask=pad_mask[valid_samples],
+            )
+
+        return out, pad_mask
 
     def forward(
         self,
-        entity_ids: Tensor,  # [N]
-        modal_embeds: Optional[Tensor] = None,  # [N, D] or None
-    ) -> Tensor:  # [N, D]
-        entity_embed = self.entity_embed(entity_ids)
-        return self.fuse_modality(entity_ids, entity_embed, modal_embeds)
+        entity_ids: Tensor,
+        text_tokens: Optional[Tensor] = None,
+        vis_tokens: Optional[Tensor] = None,
+    ) -> Tensor:
+        # 1. Entity embedding — serves as cross-attention query
+        entity_emb = self.entity_embed(entity_ids)  # [B, D]
+
+        # 2. Return early when no modality tokens are provided
+        if text_tokens is None and vis_tokens is None:
+            return entity_emb
+
+        # 3. Encode each available modality and collect results
+        ctx_parts, mask_parts = [], []
+
+        if text_tokens is not None:
+            t_emb, t_mask = self._encode_text(text_tokens)
+            ctx_parts.append(t_emb)
+            mask_parts.append(t_mask)
+
+        if vis_tokens is not None:
+            v_emb, v_mask = self._encode_vis(vis_tokens)
+            ctx_parts.append(v_emb)
+            mask_parts.append(v_mask)
+
+        # 4. Concatenate modalities into a single context sequence
+        context = torch.cat(ctx_parts, dim=1)  # [B, L_t+L_v, D]
+        ctx_mask = torch.cat(mask_parts, dim=1)  # [B, L_t+L_v]
+
+
+        # 5. Cross-attention: entity query attends over multimodal context
+        query = entity_emb.unsqueeze(1)  # [B, 1, D]
+        fused = self.fusion_decoder(query, context, mask=ctx_mask)  # [B, 1, D]
+
+        return fused.squeeze(1)  # [B, D]
 
 
 # ===========================================================================
@@ -203,13 +241,12 @@ class NeighborhoodEncoder(nn.Module):
         super().__init__()
         layer_kwargs = layer_kwargs or {}
         self.layer = build_gnn_layer(layer_types, embed_dim, **layer_kwargs)
-        
 
     def forward(
         self,
         center_ids: Tensor,  # [B]
         neighbor_graph: Dict[str, Tensor],  # packed neighbor graph
-        entity_encoder: EntityEncoder,
+        entity_encoder: Callable[[Tensor], Tensor],
         edge_encoder: EdgeEncoder,
     ) -> Tensor:  # [B, D]
         """
@@ -237,109 +274,157 @@ class NeighborhoodEncoder(nn.Module):
 
         ctx_embed = self.layer(ctx_embed, neighbor_embed, edge_embed, ptr)
 
-        raw_identity = entity_encoder.entity_embed(center_ids)
-
-        return ctx_embed + raw_identity * 0.5
+        return ctx_embed
 
 
 # ===========================================================================
 # 4. Predictor
 # ===========================================================================
 
+
+class Predictor(nn.Module):
+    """
+    Predicts the target entity context embedding conditioned on the source context,
+    the relation, and a sampled latent variable 'z'.
+
+    Architecture improvements:
+      - Uses Addition-based injection (instead of concatenation) for the latent variable,
+        allowing a learned, smooth semantic shift in the hidden space.
+      - Injects 'z' before the activation function to enable complex non-linear interactions.
+      - Standardized Dropout placement (Linear -> GELU -> Dropout).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        nhead: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.positional_embedding = nn.Parameter(
+            torch.randn(2, embed_dim)
+        )  # Learnable positional embedding
+        self.query_norm = RMSNorm(embed_dim)
+        self.encoder = TransformerBlock(in_dim=embed_dim, nhead=nhead, dropout=dropout)
+        self.decoder = TransformerBlock(in_dim=embed_dim, nhead=nhead, dropout=dropout)
+
+    def forward(
+        self,
+        head_ctx_embed: Tensor,  # [B, D]
+        rel_embed: Tensor,  # [B, D]
+        num_samples: int = 8,  # K samples for diversity
+    ) -> Tensor:  # [B, K, D] or [B, D]
+        batch_size, device = head_ctx_embed.size(0), head_ctx_embed.device
+
+        # Process context -> [B, 2, hidden_dim]
+        ctx = torch.stack([head_ctx_embed, rel_embed], dim=1)
+        # ctx = ctx + self.positional_embedding.unsqueeze(0)
+        ctx = self.encoder(ctx)
+
+        # Sample and process latent variable 'z' -> [B, K, hidden_dim]
+        z = torch.randn(batch_size, num_samples, self.embed_dim, device=device)
+
+        query = self.query_norm(rel_embed.unsqueeze(1) + z)  # [B, K, D]
+
+        # Pass through decoder block -> [B, K, D]
+        pred_embed = self.decoder(query, ctx)
+
+        return pred_embed
+
+
 # class Predictor(nn.Module):
 #     """
-#     Predicts the tail-entity context embedding from:
-#       - the head entity's context embedding  (GNN output)
-#       - the relation embedding connecting head and tail
-
-#     Architecture: a 2-layer MLP with residual connection.
-
-#     Parameters
-#     ----------
-#     embed_dim  : input and output dimension
-#     hidden_dim : hidden layer width (defaults to 2 * embed_dim)
-#     dropout    : dropout probability
+#     JEPA Predictor leveraging a continuous latent variable 'z' to handle
+#     one-to-many (1-to-N) relationships by mapping to a prediction manifold.
 #     """
 
 #     def __init__(
 #         self,
-#         embed_dim:  int,
-#         hidden_dim: Optional[int] = None,
-#         dropout:    float = 0.1,
+#         embed_dim: int,
+#         rank: int,
+#         dropout: float,
+#         latent_dim: Optional[int] = None,
 #     ) -> None:
 #         super().__init__()
-#         hidden_dim = hidden_dim or (2 * embed_dim)
+#         self.embed_dim = embed_dim
+#         self.rank = rank
+#         self.latent_dim = (
+#             embed_dim if latent_dim is None else latent_dim
+#         )  # default latent dimension
 
-#         self.mlp = nn.Sequential(
-#             nn.Linear(2 * embed_dim, hidden_dim),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden_dim, embed_dim),
-#         )
+#         # Relation-conditioned LoRA transformations
+#         self.rel_to_A = nn.Linear(2 * embed_dim, embed_dim * rank)
+#         self.rel_to_B = nn.Linear(2 * embed_dim, rank * embed_dim)
+#         self.rel_to_b = nn.Linear(2 * embed_dim, embed_dim)
+#         self.out_norm = RMSNorm(embed_dim)
+
+#         self.scale = embed_dim**-0.5
+#         self.dropout = nn.Dropout(dropout)
+#         self._init_weights()
+
+#     def _init_weights(self):
+#         nn.init.kaiming_uniform_(self.rel_to_A.weight)
+#         nn.init.zeros_(self.rel_to_A.bias)
+#         nn.init.zeros_(self.rel_to_B.weight)
+#         nn.init.zeros_(self.rel_to_B.bias)
+#         nn.init.xavier_uniform_(self.rel_to_b.weight)
+#         nn.init.zeros_(self.rel_to_b.bias)
+#         # nn.init.xavier_uniform_(self.z_to_bottleneck.weight)
+#         # nn.init.zeros_(self.z_to_bottleneck.bias)
 
 #     def forward(
-#         self,
-#         head_ctx_embed: Tensor,   # [B, D]
-#         rel_embed:      Tensor,   # [B, D]
-#     ) -> Tensor:                  # [B, D]
-#         x = torch.cat([head_ctx_embed, rel_embed], dim=-1)   # [B, 2D]
-#         pred_embed = self.mlp(x)                             # [B, D]
-#         # residual: prediction stays close to the head context
-#         return pred_embed + head_ctx_embed
+#         self, head_ctx_embed: Tensor, rel_embed: Tensor, num_samples: int = 8
+#     ) -> Tensor:
+#         """
+#         Forward pass that samples 'num_samples' latent noises to generate multiple predictions.
 
+#         Parameters
+#         ----------
+#         head_ctx_embed : Tensor [B, D] - Head entity context embedding
+#         rel_embed      : Tensor [B, D] - Relation embedding
+#         num_samples    : int           - Number of Monte Carlo samples for latent z
 
-class Predictor(nn.Module):
-    """
-    LoRA-style predictor.
-    """
+#         Returns
+#         -------
+#         Tensor [B, K, D] - K distinct predicted tail embeddings (where K = num_samples)
+#         """
+#         B, D = head_ctx_embed.shape
+#         r = self.rank
+#         K = num_samples
 
-    def __init__(self, embed_dim: int, rank: int, dropout: float):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.rank = rank
+#         # 1. Compute dynamic relation-specific LoRA weights
+#         A_flat = self.rel_to_A(
+#             torch.concat([head_ctx_embed, rel_embed], dim=-1)
+#         )  # [B, D*r]
+#         B_flat = self.rel_to_B(
+#             torch.concat([head_ctx_embed, rel_embed], dim=-1)
+#         )  # [B, r*D]
+#         b = self.rel_to_b(torch.concat([head_ctx_embed, rel_embed], dim=-1))  # [B, D]
 
-        self.rel_to_A = nn.Linear(embed_dim, embed_dim * rank)
-        self.rel_to_B = nn.Linear(embed_dim, rank * embed_dim)
-        self.rel_to_b = nn.Linear(embed_dim, embed_dim)
+#         lora_A = A_flat.view(B, D, r)  # [B, D, r]
+#         lora_B = B_flat.view(B, r, D)  # [B, r, D]
 
-        self.scale = embed_dim**-0.5
-        self.dropout = nn.Dropout(dropout)
-        
-        self._init_weights()
+#         # 2. Project head context to bottleneck space
+#         Bh = torch.bmm(lora_B, head_ctx_embed.unsqueeze(-1)).squeeze(-1)  # [B, r]
+#         Bh = self.dropout(Bh)
 
-    def _init_weights(self):
-        nn.init.kaiming_uniform_(self.rel_to_A.weight)
-        nn.init.zeros_(self.rel_to_A.bias)
+#         # 3. Sample latent variable z ~ N(0, I) and project to bottleneck space
+#         z = torch.randn(
+#             size=(B, K, self.rank), device=head_ctx_embed.device
+#         )  # [B, K, latent_dim]
+#         # z_feat = self.z_to_bottleneck(z)  # [B, K, r]
 
-        nn.init.zeros_(self.rel_to_B.weight)
-        nn.init.zeros_(self.rel_to_B.bias)
+#         # 4. Fuse deterministic context with stochastic latent features
+#         Bh_latent = Bh.unsqueeze(1) + z  # [B, K, r]
 
-        nn.init.xavier_uniform_(self.rel_to_b.weight)
-        nn.init.zeros_(self.rel_to_b.bias)
+#         # 5. Project back to embedding dimension and add relation bias
+#         ABh = torch.bmm(lora_A, Bh_latent.transpose(1, 2))  # [B, D, K]
+#         ABh = ABh.permute(0, 2, 1)  # [B, K, D]
 
-    def forward(self, head_ctx_embed: Tensor, rel_embed: Tensor) -> Tensor:
-        B, D = head_ctx_embed.shape
-        r = self.rank
-
-        A_flat = self.rel_to_A(rel_embed)  # [B, D*r]
-        B_flat = self.rel_to_B(rel_embed)  # [B, r*D]
-        b = self.rel_to_b(rel_embed)  # [B, D]
-
-        A = A_flat.view(B, D, r)  # [B, D, r]
-        B = B_flat.view(B, r, D)  # [B, r, D]
-
-        # Bottleneck: project down to r-dim
-        Bh = torch.bmm(B, head_ctx_embed.unsqueeze(-1))  # [B, r, 1]
-        Bh = self.dropout(Bh)  # dropout on bottleneck
-
-        # Project back up to D-dim
-        ABh = torch.bmm(A, Bh).squeeze(-1)  # [B, D]
-
-        out = ABh * self.scale + b
-        return out
+#         out = ABh + b.unsqueeze(1)  # [B, K, D]
+#         out = self.out_norm(out)
+#         return out
 
 
 # ===========================================================================
@@ -386,7 +471,7 @@ class KGJEPAModel(nn.Module):
     num_entities   : vocabulary size for entities
     num_relations  : vocabulary size for relations
     embed_dim      : unified embedding dimension
-    rank           : rank for the LoRA-style predictor
+    nhead          : number of attention heads for the predictor
     layer_types    : one layer-type string per GNN layer, e.g. ``["gcn","gat"]``
     layer_kwargs   : extra kwargs for GNN layers (dropout, num_heads, …)
     pred_dropout   : dropout in the predictor
@@ -397,7 +482,7 @@ class KGJEPAModel(nn.Module):
         num_entities: int,
         num_relations: int,
         embed_dim: int,
-        rank: int,
+        nhead: int,
         pred_dropout: float,
         layer_types: Optional[List[str]] = None,
         layer_kwargs: Optional[dict] = None,
@@ -407,9 +492,13 @@ class KGJEPAModel(nn.Module):
         self.num_entities = num_entities
         self.num_relations = num_relations
 
-
         # ── shared encoders ───────────────────────────────────────────
-        self.entity_encoder = EntityEncoder(num_entities, embed_dim)
+        self.entity_encoder = EntityEncoder(
+            num_entities=num_entities,
+            embed_dim=embed_dim,
+            nhead=nhead,
+            dropout=pred_dropout,
+        )
         self.edge_encoder = EdgeEncoder(num_relations * 2, embed_dim)
 
         # ── single online neighborhood encoder (updated by backprop) ──
@@ -423,7 +512,7 @@ class KGJEPAModel(nn.Module):
         # ── predictor ─────────────────────────────────────────────────
         self.predictor = Predictor(
             embed_dim=embed_dim,
-            rank=rank,
+            nhead=nhead,
             dropout=pred_dropout,
         )
 
@@ -437,8 +526,6 @@ class KGJEPAModel(nn.Module):
     def forward(
         self,
         batch: Dict[str, object],
-        head_modal_embeds: Optional[Tensor] = None,  # [B, D] MMKG, TBD
-        tail_modal_embeds: Optional[Tensor] = None,  # [B, D] MMKG, TBD
     ) -> Tuple[Tensor, Tensor]:
         """
         Parameters
@@ -447,8 +534,6 @@ class KGJEPAModel(nn.Module):
             - ``triples``       : LongTensor [B, 3]  (head, relation, tail)
             - ``head_neighbor`` : packed neighbor graph for head entities
             - ``tail_neighbor`` : packed neighbor graph for tail entities
-        head_modal_embeds : optional modal representation for heads (MMKG, TBD)
-        tail_modal_embeds : optional modal representation for tails (MMKG, TBD)
 
         Returns
         -------
@@ -458,6 +543,29 @@ class KGJEPAModel(nn.Module):
         triples: Tensor = batch["triples"]  # [B, 3]
         head_neighbor: Dict[str, Tensor] = batch["head_neighbor"]
         tail_neighbor: Dict[str, Tensor] = batch["tail_neighbor"]
+
+        # --- Multimodal Fusion for the whole batch ---
+        batch_entities = batch["batch_entities"]
+        text_tokens = batch["text_tokens"]
+        vis_tokens = batch["vis_tokens"]
+        device = batch_entities.device
+
+        # [Num_Batch_Entities, D]
+        fused_batch_embeds = self.entity_encoder(
+            batch_entities,
+            text_tokens=text_tokens,
+            vis_tokens=vis_tokens,
+        )
+
+        # Create a local fast-lookup function for NeighborhoodEncoder
+        id_to_idx = torch.full(
+            (self.num_entities,), -1, device=device, dtype=torch.long
+        )
+        id_to_idx[batch_entities] = torch.arange(len(batch_entities), device=device)
+
+        def entity_lookup(ids: Tensor) -> Tensor:
+            # assert (id_to_idx[ids] >= 0).all(), f"OOB entity ids: {ids[id_to_idx[ids] < 0]}"
+            return fused_batch_embeds[id_to_idx[ids]]
 
         head_ids = triples[:, 0]  # [B]
         rel_ids = triples[:, 1]  # [B]
@@ -470,9 +578,9 @@ class KGJEPAModel(nn.Module):
         head_ctx_embed: Tensor = self.neighborhood_encoder(
             center_ids=head_ids,
             neighbor_graph=head_neighbor,
-            entity_encoder=self.entity_encoder,
+            entity_encoder=entity_lookup,
             edge_encoder=self.edge_encoder,
-        )  # [B, D]
+        )
 
         # ── predict tail context embedding ────────────────────────────
         pred_embed: Tensor = self.predictor(head_ctx_embed, rel_embed)  # [B, D]
@@ -481,7 +589,7 @@ class KGJEPAModel(nn.Module):
         tail_ctx_embed: Tensor = self.neighborhood_encoder(
             center_ids=tail_ids,
             neighbor_graph=tail_neighbor,
-            entity_encoder=self.entity_encoder,
+            entity_encoder=entity_lookup,
             edge_encoder=self.edge_encoder,
         )  # [B, D]
 
@@ -516,41 +624,54 @@ class KGJEPAModel(nn.Module):
 
         self.eval()
         for batch in entity_loader:
-            entity_ids: Tensor = batch["entity"].squeeze(1).to(device)  # [B]
+            entity_ids: Tensor = batch["entity"].squeeze(1).to(device)
             neighbor_graph = {k: v.to(device) for k, v in batch["neighbor"].items()}
+
+            # --- Load modal tokens and compute local batch fusion ---
+            batch_entities = batch["batch_entities"].to(device)
+            text_tokens = batch["text_tokens"].to(device)
+            vis_tokens = batch["vis_tokens"].to(device)
+
+            fused_batch_embeds = self.entity_encoder(
+                batch_entities,
+                text_tokens=text_tokens,
+                vis_tokens=vis_tokens,
+            )
+
+            id_to_idx = torch.full(
+                (self.num_entities,), -1, device=device, dtype=torch.long
+            )
+            id_to_idx[batch_entities] = torch.arange(len(batch_entities), device=device)
+
+            def entity_lookup(ids: Tensor) -> Tensor:
+                # assert (id_to_idx[ids] >= 0).all(), f"OOB entity ids: {ids[id_to_idx[ids] < 0]}"
+                return fused_batch_embeds[id_to_idx[ids]]
+
+            # --------------------------------------------------------
+
             ctx_embed = self.neighborhood_encoder(
                 center_ids=entity_ids,
                 neighbor_graph=neighbor_graph,
-                entity_encoder=self.entity_encoder,
+                entity_encoder=entity_lookup,
                 edge_encoder=self.edge_encoder,
-            )  # [B, D]
+            )
             lut[entity_ids] = ctx_embed
 
-        self._lut = lut  # [num_entities, D]
+        self._lut = lut
 
     @torch.no_grad()
     def retrieve(
         self,
         batch: Dict[str, object],
-        top_k: int,
+        top_k: Optional[int] = None,  # Allow None for full-graph retrieval
         device: Optional[torch.device] = None,
         return_scores: bool = False,
+        num_samples: int = 16,  # Control Monte Carlo samples during inference
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
-        Retrieve top-K candidate entity IDs for each query triple.
-
-        Parameters
-        ----------
-        batch        : dict from EvalLoader, must contain key 'triples' [B, 3].
-        top_k        : number of top candidates to return.
-        device       : device for intermediate tensors; defaults to LUT device.
-        return_scores: if True, also return the full [B, num_entities] distance
-                    matrix needed for filtered evaluation.
-
-        Returns
-        -------
-        candidates : LongTensor [B, top_k]  (always returned)
-        scores     : FloatTensor [B, num_entities]  (only when return_scores=True)
+        Retrieve candidate entity IDs by evaluating K latent samples
+        and routing via the minimum distance (maximum similarity) strategy.
+        If top_k is None, returns the sorted indices for all entities in the graph.
         """
         if self._lut is None:
             raise RuntimeError(
@@ -565,31 +686,70 @@ class KGJEPAModel(nn.Module):
 
         head_ctx_embed = self._lut[head_ids]
         rel_embed = self.edge_encoder(rel_ids)
-        pred_embed = self.predictor(head_ctx_embed, rel_embed)
 
-        pred_norm = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
-        lut_norm = torch.nn.functional.normalize(self._lut, p=2, dim=-1)
+        # Predict K candidate embeddings using latent variable z: [B, K, D]
+        pred_embed = self.predictor(head_ctx_embed, rel_embed, num_samples=num_samples)
 
-        # Pairwise dot product on normalized vectors equals cosine similarity
-        cos_sim = torch.matmul(pred_norm, lut_norm.T)
+        # # Normalize both predictions and LUT for cosine similarity
+        # pred_norm = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)  # [B, K, D]
+        # lut_norm = torch.nn.functional.normalize(self._lut, p=2, dim=-1)    # [num_entities, D]
 
-        # Cosine distance: smaller means closer angular proximity
-        dists = 1.0 - cos_sim
+        # # Pairwise dot product: [B, K, D] x [D, num_entities] -> [B, K, num_entities]
+        # cos_sim = torch.matmul(pred_norm, lut_norm.T)
 
-        candidates = dists.topk(top_k, dim=1, largest=False).indices
+        # # Route via max similarity (min distance) across all K latent samples: [B, num_entities]
+        # mean_cos_sim = torch.mean(cos_sim, dim=1)
 
-        if return_scores:
-            return candidates, dists
-        return candidates
+        # # Convert to distance score (smaller means closer)
+        # dists = 1.0 - mean_cos_sim
 
-        # # Full pairwise L2 distances [B, num_entities]
-        # dists = torch.cdist(pred_embed, self._lut, p=2)
-
-        # candidates = dists.topk(top_k, dim=1, largest=False).indices  # [B, top_k]
+        # # Handle full-graph evaluation (Standard KGC protocol) vs Top-K search
+        # if top_k is None:
+        #     candidates = torch.argsort(dists, dim=1)
+        # else:
+        #     candidates = dists.topk(top_k, dim=1, largest=False).indices
 
         # if return_scores:
         #     return candidates, dists
         # return candidates
+
+        # dists_all = torch.cdist(pred_embed, self._lut.unsqueeze(0), p=2)
+
+        # # Route via minimum distance across all K latent samples: [B, num_entities]
+        # # This finds the closest prediction among the K samples for each entity
+        # dists = torch.min(dists_all, dim=1).values
+
+        # # Handle full-graph evaluation (Standard KGC protocol) vs Top-K search
+        # if top_k is None:
+        #     # Default behavior of argsort is ascending (smallest distance first)
+        #     candidates = torch.argsort(dists, dim=1)
+        # else:
+        #     # Retrieve the indices of the smallest distances
+        #     candidates = dists.topk(top_k, dim=1, largest=False).indices
+
+        # if return_scores:
+        #     return candidates, dists
+        # return candidates
+
+        # Pairwise dot product without normalization
+        # pred_embed: [B, K, D], lut: [num_entities, D] -> Output: [B, K, num_entities]
+        dot_product = torch.matmul(pred_embed, self._lut.T)
+
+        # Route via maximum dot product (higher is more similar)
+        max_dot = torch.max(dot_product, dim=1).values
+
+        # Convert similarity to a descending metric (or use descending=True in argsort)
+        dists = -max_dot
+
+        if return_scores:
+            return dists
+        else:
+            # Handle full-graph evaluation (Standard KGC protocol) vs Top-K search
+            if top_k is None:
+                candidates = torch.argsort(dists, dim=1)
+            else:
+                candidates = dists.topk(top_k, dim=1, largest=False).indices
+            return candidates
 
         # pred_embed_norm = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
         # lut_norm = torch.nn.functional.normalize(self._lut, p=2, dim=-1)

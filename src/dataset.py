@@ -1,10 +1,12 @@
+import json
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 # ---------------------------------------------------------------------------
@@ -12,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 # ---------------------------------------------------------------------------
 
 Triple = Tuple[int, int, int]
+# Mapping: entity_id -> (neighbor_entity_ids, edge_type_ids)
 NeighborIndex = Dict[int, Tuple[Tensor, Tensor]]
 
 # ---------------------------------------------------------------------------
@@ -23,7 +26,9 @@ SUPPORTED_DATASETS = {"DB15K", "MKG-W", "MKG-Y"}
 
 def _check_dataset(dataset: str) -> None:
     if dataset not in SUPPORTED_DATASETS:
-        raise ValueError(f"Unknown dataset '{dataset}'. Choose from {SUPPORTED_DATASETS}.")
+        raise ValueError(
+            f"Unknown dataset '{dataset}'. Choose from {SUPPORTED_DATASETS}."
+        )
 
 
 def load_triples(path: str) -> List[Triple]:
@@ -50,22 +55,63 @@ def load_splits(dataset_dir: str, splits: List[str]) -> List[Triple]:
     return triples
 
 
+def load_modal_features(
+    dataset: str, modality: str, top_n: int, pad_val: int = -1
+) -> Dict[int, Tensor]:
+    """Load token IDs from JSON, retaining the top-N most frequent tokens per entity.
+    Entities with fewer than top_n tokens are right-padded with -1."""
+    path = os.path.join("tokens", f"{dataset}-{modality}.json")
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    result = {}
+    for k, v in data.items():
+        if not v:
+            # All-padding tensor for entities with no tokens
+            result[int(k)] = torch.full((top_n,), pad_val, dtype=torch.long)
+            continue
+        tokens = torch.tensor(v, dtype=torch.long)
+        unique_tokens, counts = tokens.unique(return_counts=True)
+        top_n_actual = min(top_n, len(unique_tokens))
+        top_indices = counts.topk(top_n_actual).indices
+        selected = unique_tokens[top_indices]
+
+        # Pad to fixed length top_n with pad_val
+        padded = torch.full((top_n,), pad_val, dtype=torch.long)
+        padded[:top_n_actual] = selected
+        result[int(k)] = padded
+    return result
+
+
+def _get_padded_tokens(
+    entities: Tensor, token_dict: Dict[int, Tensor], pad_val: int = -1
+) -> Tensor:
+    """Fetch and pad tokens for a given 1D tensor of entity IDs."""
+    # Use empty tensor for missing entities to let pad_sequence handle it gracefully
+    tokens = [
+        token_dict.get(int(e), torch.empty(0, dtype=torch.long)) for e in entities
+    ]
+    # Pad variable-length sequences to the max length in this batch
+    return pad_sequence(tokens, batch_first=True, padding_value=pad_val)
+
+
 # ---------------------------------------------------------------------------
 # Neighbor index
 # ---------------------------------------------------------------------------
 
+
 def build_neighbor_index(triples: List[Triple], num_relations: int) -> NeighborIndex:
     """
-    Build a per-entity neighbor index from triples (undirected: both directions
-    are indexed).
-
-    Returns a dict mapping entity_id → (neighbor_ids: LongTensor,
-                                         edge_types:   LongTensor).
+    Build an undirected per-entity neighbor index.
+    Forward edges use relation `r`; inverse edges use `r + num_relations`.
     """
     adj: Dict[int, Tuple[List[int], List[int]]] = defaultdict(lambda: ([], []))
     for h, r, t in triples:
-        adj[h][0].append(t);  adj[h][1].append(r)
-        adj[t][0].append(h);  adj[t][1].append(r + num_relations)
+        adj[h][0].append(t)
+        adj[h][1].append(r)
+
+        adj[t][0].append(h)
+        adj[t][1].append(r + num_relations)
 
     return {
         e: (torch.tensor(nb, dtype=torch.long), torch.tensor(et, dtype=torch.long))
@@ -77,47 +123,53 @@ def build_neighbor_index(triples: List[Triple], num_relations: int) -> NeighborI
 # Shared edge-packing utilities
 # ---------------------------------------------------------------------------
 
+
 def _neighbor_edges(
     entity: int,
     neighbor_index: NeighborIndex,
     exclude_entity: Optional[int] = None,
     exclude_relation: Optional[int] = None,
+    drop_rate: float = 0.0,
 ) -> Tuple[Tensor, Tensor]:
     """
-    Return 1-hop neighbourhood of `entity`, masking only the specific target edge.
+    Extract 1-hop neighborhood for a given entity.
+    Optionally masks a specific target edge (exact match on entity and relation).
+    Optionally applies random edge dropout for data augmentation.
     """
     if entity not in neighbor_index:
         return torch.zeros((2, 0), dtype=torch.long), torch.zeros(0, dtype=torch.long)
 
     neighbors, edge_types = neighbor_index[entity]
-    
-    # Target Edge Masking: Mask only if BOTH entity and relation match
+
     if exclude_entity is not None and exclude_relation is not None:
         mask = ~((neighbors == exclude_entity) & (edge_types == exclude_relation))
         neighbors, edge_types = neighbors[mask], edge_types[mask]
+
+    if drop_rate > 0.0 and neighbors.numel() > 0:
+        keep_mask = torch.rand(neighbors.size(0)) >= drop_rate
+        neighbors, edge_types = neighbors[keep_mask], edge_types[keep_mask]
 
     src = torch.full((neighbors.size(0),), entity, dtype=torch.long)
     return torch.stack([src, neighbors], dim=0), edge_types
 
 
 def _pack_edges(
-    edge_indices: List[Tensor],
-    edge_attrs: List[Tensor],
+    edge_indices: List[Tensor], edge_attrs: List[Tensor]
 ) -> Dict[str, Tensor]:
     """
-    Concatenate per-sample edge tensors and build a ptr for O(1) slicing.
+    Concatenate edge tensors for a batch and build a PyG-style pointer.
 
     Returns:
-        edge_index – [2, total_edges]  global entity IDs
-        edge_attr  – [total_edges]     relation IDs
-        ptr        – [B+1]             ptr[i]:ptr[i+1] selects sample i's edges
+        edge_index: [2, total_edges]
+        edge_attr:  [total_edges]
+        ptr:        [B + 1] boundary indices for O(1) slicing
     """
     counts = torch.tensor([e.size(1) for e in edge_indices], dtype=torch.long)
     ptr = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)])
     return {
         "edge_index": torch.cat(edge_indices, dim=1),
-        "edge_attr":  torch.cat(edge_attrs,   dim=0),
-        "ptr":        ptr,
+        "edge_attr": torch.cat(edge_attrs, dim=0),
+        "ptr": ptr,
     }
 
 
@@ -125,8 +177,9 @@ def _pack_edges(
 # Datasets
 # ---------------------------------------------------------------------------
 
+
 class KGTripleDataset(Dataset):
-    """Wraps a flat list of (head, relation, tail) triples."""
+    """Dataset wrapper for a flat list of (head, relation, tail) triples."""
 
     def __init__(self, triples: List[Triple]) -> None:
         self.triples = triples
@@ -139,15 +192,10 @@ class KGTripleDataset(Dataset):
 
 
 class KGEntityDataset(Dataset):
-    """
-    Iterates over every unique entity id present in the neighbor index.
-    Used by EntityLoader to stream the full graph entity-by-entity.
-    """
+    """Dataset wrapper streaming unique entities from the neighbor index."""
 
     def __init__(self, neighbor_index: NeighborIndex) -> None:
-        self.entities = torch.tensor(
-            sorted(neighbor_index.keys()), dtype=torch.long
-        )  # [N]
+        self.entities = torch.tensor(sorted(neighbor_index.keys()), dtype=torch.long)
 
     def __len__(self) -> int:
         return len(self.entities)
@@ -160,85 +208,154 @@ class KGEntityDataset(Dataset):
 # Collate functions
 # ---------------------------------------------------------------------------
 
+
 def _collate_train(
     batch: List[Triple],
     neighbor_index: NeighborIndex,
-    num_relations: int,  # Added to compute inverse relation
-) -> Dict[str, object]:
+    num_relations: int,
+    text_dict: Dict[int, Tensor],
+    vis_dict: Dict[int, Tensor],
+    top_n: int,
+    drop_rate: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Collate function for training. Returns triples and their contextual subgraphs
+    with the direct target edge masked out to prevent data leakage.
+    """
     heads, rels, tails = zip(*batch)
     triples_t = torch.tensor(list(zip(heads, rels, tails)), dtype=torch.long)
 
     h_ei, h_ea, t_ei, t_ea = [], [], [], []
     for h, r, t in zip(heads, rels, tails):
-        # Head sub-graph: exclude the forward edge (h -[r]-> t)
-        ei, ea = _neighbor_edges(h, neighbor_index, exclude_entity=t, exclude_relation=r)
-        h_ei.append(ei); h_ea.append(ea)
-        
-        # Tail sub-graph: exclude the inverse edge (t -[r_inv]-> h)
-        r_inv = r + num_relations
-        ei, ea = _neighbor_edges(t, neighbor_index, exclude_entity=h, exclude_relation=r_inv)
-        t_ei.append(ei); t_ea.append(ea)
+        # Mask direct forward edge
+        ei, ea = _neighbor_edges(
+            h, neighbor_index, exclude_entity=t, exclude_relation=r, drop_rate=drop_rate
+        )
+        h_ei.append(ei)
+        h_ea.append(ea)
+
+        # Mask direct inverse edge (modulo ensures safety for augmented triples)
+        r_inv = (r + num_relations) % (2 * num_relations)
+        ei, ea = _neighbor_edges(
+            t,
+            neighbor_index,
+            exclude_entity=h,
+            exclude_relation=r_inv,
+            drop_rate=drop_rate,
+        )
+        t_ei.append(ei)
+        t_ea.append(ea)
+
+    head_neighbor = _pack_edges(h_ei, h_ea)
+    tail_neighbor = _pack_edges(t_ei, t_ea)
+
+    # Extract all unique entities involved in this batch for efficient feature fetching
+    batch_entities = torch.cat(
+        [
+            triples_t[:, 0],
+            triples_t[:, 2],
+            head_neighbor["edge_index"][1],
+            tail_neighbor["edge_index"][1],
+        ]
+    ).unique()
 
     return {
-        "triples":       triples_t,
-        "head_neighbor": _pack_edges(h_ei, h_ea),
-        "tail_neighbor": _pack_edges(t_ei, t_ea),
+        "triples": triples_t,
+        "head_neighbor": head_neighbor,
+        "tail_neighbor": tail_neighbor,
+        "batch_entities": batch_entities,  # To map embeddings back to triples/edges downstream
+        "text_tokens": torch.stack(
+            [
+                text_dict.get(int(e), torch.full((top_n,), -1, dtype=torch.long))
+                for e in batch_entities
+            ]
+        ),
+        "vis_tokens": torch.stack(
+            [
+                vis_dict.get(int(e), torch.full((top_n,), -1, dtype=torch.long))
+                for e in batch_entities
+            ]
+        ),
     }
 
 
 def _collate_entity(
     batch: List[int],
     neighbor_index: NeighborIndex,
-) -> Dict[str, object]:
-    """
-    Collate for entity iteration: returns entity ids + their full 1-hop
-    neighborhoods (no exclusion).
-
-    Batch dict keys
-    ---------------
-    entity    LongTensor [B, 1]   entity ids
-    neighbor  dict(edge_index [2, E], edge_attr [E], ptr [B+1])
-    """
+    text_dict: Dict[int, Tensor],
+    vis_dict: Dict[int, Tensor],
+    top_n: int,
+) -> Dict[str, Any]:
+    """Collate function yielding entity IDs and their full 1-hop neighborhoods."""
     ei_list, ea_list = [], []
     for e in batch:
         ei, ea = _neighbor_edges(e, neighbor_index)
-        ei_list.append(ei); ea_list.append(ea)
+        ei_list.append(ei)
+        ea_list.append(ea)
+
+    neighbor = _pack_edges(ei_list, ea_list)
+    batch_t = torch.tensor(batch, dtype=torch.long)
+
+    batch_entities = torch.cat([batch_t, neighbor["edge_index"][1]]).unique()
 
     return {
-        "entity":   torch.tensor(batch, dtype=torch.long).unsqueeze(1),  # [B, 1]
-        "neighbor": _pack_edges(ei_list, ea_list),
+        "entity": batch_t.unsqueeze(1),
+        "neighbor": neighbor,
+        "batch_entities": batch_entities,
+        "text_tokens": torch.stack(
+            [
+                text_dict.get(int(e), torch.full((top_n,), -1, dtype=torch.long))
+                for e in batch_entities
+            ]
+        ),
+        "vis_tokens": torch.stack(
+            [
+                vis_dict.get(int(e), torch.full((top_n,), -1, dtype=torch.long))
+                for e in batch_entities
+            ]
+        ),
     }
 
 
-def _collate_eval(batch: List[Triple]) -> Dict[str, Tensor]:
-    """Collate for evaluation: returns only triples, no graph structure."""
-    return {"triples": torch.tensor(list(batch), dtype=torch.long)}
+def _collate_eval(
+    batch: List[Triple],
+    text_dict: Dict[int, Tensor],
+    vis_dict: Dict[int, Tensor],
+    top_n: int,
+) -> Dict[str, Tensor]:
+    """Collate function for evaluation yielding only batched triples."""
+
+    triples = torch.tensor(list(batch), dtype=torch.long)
+    batch_entities = torch.cat([triples[:, 0], triples[:, 2]]).unique()
+
+    return {
+        "triples": triples,
+        "batch_entities": batch_entities,
+        "text_tokens": torch.stack(
+            [
+                text_dict.get(int(e), torch.full((top_n,), -1, dtype=torch.long))
+                for e in batch_entities
+            ]
+        ),
+        "vis_tokens": torch.stack(
+            [
+                vis_dict.get(int(e), torch.full((top_n,), -1, dtype=torch.long))
+                for e in batch_entities
+            ]
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Public loader classes
 # ---------------------------------------------------------------------------
 
+
 class TrainKGLoader:
     """
-    Dataloader for model training.  Loads ``train.txt`` and returns, for every
-    batch, the triples together with the 1-hop neighborhoods of the head and
-    tail entities (direct edge excluded).
-
-    Parameters
-    ----------
-    data_root      : root directory containing per-dataset sub-folders
-    dataset        : one of {"DB15K", "MKG-W", "MKG-Y"}
-    batch_size     : triples per batch
-    shuffle        : whether to shuffle each epoch
-    num_workers    : DataLoader worker processes
-    neighbor_index : pre-built index (built from all splits if None)
-
-    Batch keys
-    ----------
-    triples        LongTensor [B, 3]
-    head_neighbor  dict(edge_index, edge_attr, ptr)
-    tail_neighbor  dict(edge_index, edge_attr, ptr)
+    Dataloader for model training.
+    Yields batches containing triples and 1-hop subgraphs (with target edges masked).
+    Automatically augments training data with inverse triples.
     """
 
     def __init__(
@@ -246,37 +363,23 @@ class TrainKGLoader:
         data_root: str,
         dataset: str,
         num_relations: int,
+        top_n: int,
         batch_size: int,
+        drop_rate: float = 0.0,
         shuffle: bool = True,
         num_workers: int = 0,
+        prefetch_factor: int = 2,
         neighbor_index: Optional[NeighborIndex] = None,
     ) -> None:
         _check_dataset(dataset)
         dataset_dir = os.path.join(data_root, dataset)
 
-        # self.neighbor_index = neighbor_index or build_neighbor_index(
-        #     load_splits(dataset_dir, ["train"]), num_relations
-        # )
+        # Load multi-modal token dictionaries into memory once
+        self.text_dict = load_modal_features(dataset, "textual", top_n=top_n)
+        self.vis_dict = load_modal_features(dataset, "visual", top_n=top_n)
 
-        # self._loader = DataLoader(
-        #     KGTripleDataset(load_split(dataset_dir, "train")),
-        #     batch_size=batch_size,
-        #     shuffle=shuffle,
-        #     num_workers=num_workers,
-        #     collate_fn=partial(
-        #         _collate_train, 
-        #         neighbor_index=self.neighbor_index,
-        #         num_relations=num_relations
-        #     ),
-        # )
-        # 1. Load original forward triples
         train_triples = load_split(dataset_dir, "train")
-
-        # 2. Augment training data with inverse triples to learn bidirectional embeddings
-        # This ensures the model learns valid representations for 'r + num_relations'
-        inverse_triples = [
-            (t, r + num_relations, h) for h, r, t in train_triples
-        ]
+        inverse_triples = [(t, r + num_relations, h) for h, r, t in train_triples]
         all_train_triples = train_triples + inverse_triples
 
         self.neighbor_index = neighbor_index or build_neighbor_index(
@@ -284,15 +387,19 @@ class TrainKGLoader:
         )
 
         self._loader = DataLoader(
-            # 3. Pass the augmented dataset to the dataloader
             KGTripleDataset(all_train_triples),
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             collate_fn=partial(
-                _collate_train, 
+                _collate_train,
                 neighbor_index=self.neighbor_index,
-                num_relations=num_relations
+                num_relations=num_relations,
+                text_dict=self.text_dict,
+                vis_dict=self.vis_dict,
+                top_n=top_n,
+                drop_rate=drop_rate,
             ),
         )
 
@@ -305,30 +412,8 @@ class TrainKGLoader:
 
 class EntityLoader:
     """
-    Dataloader that streams every entity in the graph exactly once per epoch,
-    yielding each entity together with its complete 1-hop neighborhood.
-
-    Useful for pre-computing entity representations without leakage concerns.
-
-    Parameters
-    ----------
-    data_root      : root directory containing per-dataset sub-folders
-    dataset        : one of {"DB15K", "MKG-W", "MKG-Y"}
-    include_valid  : if True, build the neighbor index from train + valid;
-                     otherwise train only
-    batch_size     : entities per batch
-    shuffle        : whether to shuffle entity order
-    num_workers    : DataLoader worker processes
-    neighbor_index : pre-built index (built from selected splits if None)
-
-    Batch keys
-    ----------
-    entity    LongTensor [B, 1]   entity ids
-    neighbor  dict(edge_index [2, E], edge_attr [E], ptr [B+1])
-
-    Notes
-    -----
-    len(loader) == ceil(num_entities / batch_size)
+    Dataloader streaming every graph entity exactly once per epoch along with
+    its complete 1-hop neighborhood. Ideal for pre-computing entity representations.
     """
 
     def __init__(
@@ -336,19 +421,24 @@ class EntityLoader:
         data_root: str,
         dataset: str,
         num_relations: int,
+        top_n: int,
         batch_size: int,
         include_valid: bool = False,
         shuffle: bool = False,
         num_workers: int = 0,
+        prefetch_factor: int = 2,
         neighbor_index: Optional[NeighborIndex] = None,
     ) -> None:
         _check_dataset(dataset)
         dataset_dir = os.path.join(data_root, dataset)
 
+        # Load multi-modal token dictionaries into memory once
+        self.text_dict = load_modal_features(dataset, "textual", top_n=top_n)
+        self.vis_dict = load_modal_features(dataset, "visual", top_n=top_n)
+
         splits = ["train", "valid"] if include_valid else ["train"]
         self.neighbor_index = neighbor_index or build_neighbor_index(
-            load_splits(dataset_dir, splits),
-            num_relations
+            load_splits(dataset_dir, splits), num_relations
         )
 
         self._loader = DataLoader(
@@ -356,7 +446,14 @@ class EntityLoader:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            collate_fn=partial(_collate_entity, neighbor_index=self.neighbor_index),
+            prefetch_factor=prefetch_factor,
+            collate_fn=partial(
+                _collate_entity,
+                neighbor_index=self.neighbor_index,
+                text_dict=self.text_dict,
+                vis_dict=self.vis_dict,
+                top_n=top_n,
+            ),
         )
 
     def __iter__(self):
@@ -372,33 +469,27 @@ class EntityLoader:
 
 class EvalLoader:
     """
-    Dataloader for inference / evaluation.  Loads ``valid.txt`` or ``test.txt``
-    and returns only triples — no graph structure is included.
-
-    Parameters
-    ----------
-    data_root  : root directory containing per-dataset sub-folders
-    dataset    : one of {"DB15K", "MKG-W", "MKG-Y"}
-    split      : "valid" or "test"
-    batch_size : triples per batch
-    num_workers: DataLoader worker processes
-
-    Batch keys
-    ----------
-    triples  LongTensor [B, 3]
+    Dataloader for inference. Yields only evaluation triples without subgraph structures.
     """
 
     def __init__(
         self,
         data_root: str,
         dataset: str,
+        top_n: int,
         batch_size: int,
         split: str = "valid",
         num_workers: int = 0,
+        prefetch_factor: int = 2,
     ) -> None:
         _check_dataset(dataset)
         if split not in ("valid", "test"):
-            raise ValueError(f"EvalLoader split must be 'valid' or 'test', got '{split}'.")
+            raise ValueError(
+                f"EvalLoader split must be 'valid' or 'test', got '{split}'."
+            )
+        # Load multi-modal token dictionaries into memory once
+        self.text_dict = load_modal_features(dataset, "textual", top_n=top_n)
+        self.vis_dict = load_modal_features(dataset, "visual", top_n=top_n)
 
         dataset_dir = os.path.join(data_root, dataset)
         self._loader = DataLoader(
@@ -406,7 +497,13 @@ class EvalLoader:
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=_collate_eval,
+            prefetch_factor=prefetch_factor,
+            collate_fn=partial(
+                _collate_eval,
+                text_dict=self.text_dict,
+                vis_dict=self.vis_dict,
+                top_n=top_n,
+            ),
         )
 
     def __iter__(self):
@@ -414,201 +511,3 @@ class EvalLoader:
 
     def __len__(self) -> int:
         return len(self._loader)
-
-
-# ---------------------------------------------------------------------------
-# Smoke-test helpers
-# ---------------------------------------------------------------------------
-
-def _graph_stats(neighbor_index: NeighborIndex, num_relations: int) -> None:
-    """Print global graph statistics derived from a neighbor index."""
-    all_edge_types: List[int] = []
-    total_edges = 0
-    for _, (_, et) in neighbor_index.items():
-        all_edge_types.extend(et.tolist())
-        total_edges += et.size(0)
-
-    et_tensor = torch.tensor(all_edge_types, dtype=torch.long)
-    num_relation_types = int(et_tensor.unique().size(0))
-    num_inverse = int((et_tensor >= num_relations).sum().item())
-
-    degrees = torch.tensor(
-        [nb.size(0) for nb, _ in neighbor_index.values()], dtype=torch.float
-    )
-    print(f"  num_entities        : {len(neighbor_index)}")
-    print(f"  num_relation_types  : {num_relation_types} (incl. inverse, base={num_relations})")
-    print(f"  num_edge_entries    : {total_edges}")
-    print(f"  num_inverse_edges   : {num_inverse}")
-    print(f"  avg degree          : {degrees.mean().item():.2f}")
-    print(f"  max degree          : {int(degrees.max().item())}")
-    print(f"  min degree          : {int(degrees.min().item())}")
-
-
-def _batch_edge_stats(label: str, ng: Dict[str, Tensor], B: int) -> None:
-    """Print per-sample edge counts and relation type diversity for one neighborhood dict."""
-    edge_attr = ng["edge_attr"]
-    ptr       = ng["ptr"]
-    num_types = int(edge_attr.unique().size(0)) if edge_attr.numel() > 0 else 0
-    counts    = (ptr[1:] - ptr[:-1]).tolist()
-    print(f"  {label}:")
-    print(f"    total edges      : {edge_attr.size(0)}")
-    print(f"    relation types   : {num_types}")
-    print(f"    edges per sample : {[int(c) for c in counts]}")
-
-
-def _infer_num_relations(dataset_dir: str) -> int:
-    """Infer num_relations from the union of relation ids across all splits."""
-    rel_ids = set()
-    for split in ("train", "valid", "test"):
-        fpath = os.path.join(dataset_dir, f"{split}.txt")
-        if os.path.exists(fpath):
-            for h, r, t in load_triples(fpath):
-                rel_ids.add(r)
-    return max(rel_ids) + 1
-
-def _infer_dataset_stats(dataset_dir: str) -> Tuple[int, int]:
-    """
-    Infer (num_entities, num_relations) from the union of entity / relation
-    ids across train + valid + test splits.
-
-    num_entities  = |{ all head/tail ids appearing in any split }|
-    num_relations = max(relation id) + 1 across all splits
-                    (base relations only, before adding inverse edges)
-    """
-    entity_ids = set()
-    rel_ids = set()
-    for split in ("train", "valid", "test"):
-        fpath = os.path.join(dataset_dir, f"{split}.txt")
-        if os.path.exists(fpath):
-            for h, r, t in load_triples(fpath):
-                entity_ids.add(h)
-                entity_ids.add(t)
-                rel_ids.add(r)
-    num_entities = len(entity_ids)
-    num_relations = max(rel_ids) + 1
-    return num_entities, num_relations
-
-
-# ---------------------------------------------------------------------------
-# Smoke-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    ROOT = "./data"
-    DS   = "MKG-W"
-    B    = 4
-
-    dataset_dir   = os.path.join(ROOT, DS)
-    num_entities_total, num_relations = _infer_dataset_stats(dataset_dir)
-    print(f"=== Dataset-level stats (train+valid+test union) ===")
-    print(f"  num_entities (union)  : {num_entities_total}")
-    print(f"  num_relations (base)  : {num_relations}")
-    print()
-
-    # ------------------------------------------------------------------ train
-    print("=== TrainKGLoader ===")
-    train_loader = TrainKGLoader(
-        ROOT, DS, num_relations=num_relations, batch_size=B, shuffle=False
-    )
-
-    print("-- Global graph stats (neighbor index, train only, fwd+inv edges) --")
-    _graph_stats(train_loader.neighbor_index, num_relations)
-
-    batch = next(iter(train_loader))
-    triples = batch["triples"]
-    hng, tng = batch["head_neighbor"], batch["tail_neighbor"]
-
-    print("-- First batch --")
-    print(f"  triples shape    : {triples.shape}")
-    _batch_edge_stats("head_neighbor", hng, B)
-    _batch_edge_stats("tail_neighbor", tng, B)
-
-    print("-- Exclusion check --")
-    for i in range(triples.size(0)):
-        h, r, t = triples[i].tolist()
-        r_inv = r + num_relations
-
-        # head subgraph: forward edge (h -[r]-> t) must be masked
-        s, e = hng["ptr"][i].item(), hng["ptr"][i + 1].item()
-        nbrs  = hng["edge_index"][1, s:e].tolist()
-        types = hng["edge_attr"][s:e].tolist()
-        leaked = any(n == t and rt == r for n, rt in zip(nbrs, types))
-        assert not leaked, f"Leakage at sample {i} (head, forward edge)"
-
-        # tail subgraph: inverse edge (t -[r+num_rel]-> h) must be masked
-        s, e = tng["ptr"][i].item(), tng["ptr"][i + 1].item()
-        nbrs  = tng["edge_index"][1, s:e].tolist()
-        types = tng["edge_attr"][s:e].tolist()
-        leaked = any(n == h and rt == r_inv for n, rt in zip(nbrs, types))
-        assert not leaked, f"Leakage at sample {i} (tail, inverse edge)"
-    print("  PASSED\n")
-
-    # --------------------------------------------------------------- entity
-    print("=== EntityLoader (train only) ===")
-    ent_loader = EntityLoader(
-        ROOT, DS, num_relations=num_relations,
-        include_valid=False, batch_size=B, shuffle=False,
-    )
-
-    print("-- Global graph stats (train only) --")
-    _graph_stats(ent_loader.neighbor_index, num_relations)
-
-    batch = next(iter(ent_loader))
-    print("-- First batch --")
-    print(f"  entity shape     : {batch['entity'].shape}")
-    _batch_edge_stats("neighbor", batch["neighbor"], B)
-    print(f"  num_entities (loader) : {ent_loader.num_entities}")
-    print()
-
-    print("=== EntityLoader (train + valid) ===")
-    ent_loader_v = EntityLoader(
-        ROOT, DS, num_relations=num_relations,
-        include_valid=True, batch_size=B, shuffle=False,
-    )
-    print("-- Global graph stats (train + valid) --")
-    _graph_stats(ent_loader_v.neighbor_index, num_relations)
-    print(f"  num_entities (loader) : {ent_loader_v.num_entities}")
-    print()
-
-    # ----------------------------------------------------------------- eval
-    train_rels = set(r for _, r, _ in load_split(dataset_dir, "train"))
-
-    for split in ("valid", "test"):
-        print(f"=== EvalLoader ({split}) ===")
-        eval_loader  = EvalLoader(ROOT, DS, split=split, batch_size=B)
-        all_triples  = torch.cat([b["triples"] for b in eval_loader], dim=0)
-        split_rels   = set(all_triples[:, 1].tolist())
-
-        unseen_rels         = split_rels - train_rels
-        unseen_triples_mask = torch.tensor(
-            [r in unseen_rels for r in all_triples[:, 1].tolist()]
-        )
-        num_unseen_triples = int(unseen_triples_mask.sum().item())
-
-        print(f"  total triples      : {all_triples.size(0)}")
-        print(f"  num_batches        : {len(eval_loader)}")
-        print(f"  relation types     : {len(split_rels)}")
-        print(f"  unseen relations   : {len(unseen_rels)} "
-              f"(not in train, ids: {sorted(unseen_rels)})")
-        print(f"  triples w/ unseen  : {num_unseen_triples} "
-              f"({100 * num_unseen_triples / all_triples.size(0):.1f}%)")
-        print(f"  first batch shape  : {next(iter(eval_loader))['triples'].shape}")
-        print()
-
-    # ----------------------------------------------------------- LUT shift
-    # Quick diagnostic: how much does each entity's neighbor SET (not just
-    # degree) change between the train-only graph and the train+valid graph?
-    # A large fraction of changed entities means the GAT-based ctx_embed for
-    # those entities at "val LUT" time differs structurally from "test LUT"
-    # time -- a likely source of the val/test metric gap discussed earlier.
-    print("=== Train-only vs Train+Valid neighbor-set diff ===")
-    common_entities = set(ent_loader.neighbor_index.keys()) & set(ent_loader_v.neighbor_index.keys())
-    changed = 0
-    for e in common_entities:
-        nb_train, _ = ent_loader.neighbor_index[e]
-        nb_val,   _ = ent_loader_v.neighbor_index[e]
-        if nb_train.size(0) != nb_val.size(0):
-            changed += 1
-    print(f"  entities present in both graphs : {len(common_entities)}")
-    print(f"  entities with degree change     : {changed} "
-          f"({100 * changed / max(len(common_entities), 1):.1f}%)")

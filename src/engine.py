@@ -14,7 +14,7 @@ from torch import optim
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, MultiStepLR
 from tqdm import tqdm
 
-from src.dataset import load_splits
+from dataset_old import load_splits
 from src.metrics import compute_all_metrics_filtered, compute_filtered_ranks
 
 
@@ -24,7 +24,7 @@ class BaseEngine:
     def __init__(
         self,
         device: torch.device,
-        model,
+        model: torch.nn.Module,
         logger: logging.Logger,
         save_path: str,
     ):
@@ -112,6 +112,7 @@ class MMKGEngine(BaseEngine):
         self.num_relations = num_relations
 
         # Training configuration
+        self.current_epoch = 1
         self.max_epochs = config["max_epochs"]
         self.lr = config["lr"]
         self.weight_decay = config["weight_decay"]
@@ -167,15 +168,15 @@ class MMKGEngine(BaseEngine):
             scaled_loss.backward()
 
             # Update metrics using unscaled values for accurate logging
-            avg_loss = avg_loss * (batch_idx / (batch_idx + 1)) + loss.item() / (
-                batch_idx + 1
-            )
-            avg_reg = avg_reg * (batch_idx / (batch_idx + 1)) + sigreg.item() / (
-                batch_idx + 1
-            )
+            avg_loss = avg_loss * (
+                batch_idx / (batch_idx + 1)
+            ) + loss.detach().cpu().item() / (batch_idx + 1)
+            avg_reg = avg_reg * (
+                batch_idx / (batch_idx + 1)
+            ) + sigreg.detach().cpu().item() / (batch_idx + 1)
 
             pbar.set_description(
-                f"Loss: {loss.item():.4f}, Reg: {sigreg.item():.4f}, "
+                f"Loss: {loss.detach().cpu().item():.4f}, Reg: {sigreg.detach().cpu().item():.4f}, "
                 f"Avg Loss: {avg_loss:.4f}, Avg Reg: {avg_reg:.4f}"
             )
 
@@ -242,72 +243,16 @@ class MMKGEngine(BaseEngine):
 
         return dict(filter_dict)
 
-    # def _evaluate(self, loader, prefix: str) -> Dict[str, float]:
-    #     self.model.eval()
-
-    #     total_metrics = {"MRR": 0.0, "Hit@1": 0.0, "Hit@3": 0.0, "Hit@10": 0.0}
-    #     total_samples = 0
-
-    #     # Build the filter dictionary once before the evaluation loop
-    #     # (requires dataset_dir to be stored, see __init__ change below)
-    #     filter_dict = self._build_filter_dict(self.dataset_dir)
-
-    #     with torch.no_grad():
-    #         self.logger.info(f"[{prefix}] Building entity Look-Up Table (LUT)...")
-    #         if prefix == "Validation":
-    #             self.model.build_lut(self.val_entity_loader, device=self.device)
-    #         elif prefix == "Test":
-    #             self.model.build_lut(self.test_entity_loader, device=self.device)
-    #         else:
-    #             raise ValueError(f"Unknown prefix: {prefix}")
-
-    #         pbar = tqdm(loader, desc=prefix, file=sys.stdout)
-    #         for batch in pbar:
-    #             batch = {k: v.to(self.device) for k, v in batch.items()}
-
-    #             # Request full score matrix for filtered ranking
-    #             _, scores = self.model.retrieve(
-    #                 batch, top_k=10, device=self.device, return_scores=True
-    #             )
-
-    #             triples = batch["triples"]  # [B, 3]
-    #             true_tails = triples[:, 2]  # [B]
-    #             current_batch_size = true_tails.size(0)
-    #             total_samples += current_batch_size
-
-    #             # Build per-query filter sets for this batch
-    #             filter_sets = [
-    #                 filter_dict.get((triples[i, 0].item(), triples[i, 1].item()), set())
-    #                 for i in range(current_batch_size)
-    #             ]
-
-    #             # Compute filtered metrics
-    #             batch_metrics = compute_all_metrics_filtered(
-    #                 scores, true_tails, filter_sets
-    #             )
-
-    #             for k in total_metrics:
-    #                 if np.isnan(batch_metrics[k]):
-    #                     self.logger.warning(f"Found NaN in {prefix} metric: {k}.")
-    #                     continue
-    #                 total_metrics[k] += batch_metrics[k] * current_batch_size
-
-    #             current_avg = {k: v / total_samples for k, v in total_metrics.items()}
-    #             pbar.set_description(
-    #                 f"{prefix}: "
-    #                 + ", ".join(f"{k}: {v:.4f}" for k, v in current_avg.items())
-    #             )
-
-    #     return current_avg
-
-    def _evaluate(self, loader, prefix: str) -> Dict[str, float]:
+    def _evaluate(self, loader, prefix: str, num_samples: int = 16) -> Dict[str, float]:
+        """
+        Evaluate the model on forward and inverse queries using latent variable sampling.
+        """
         self.model.eval()
 
         total_metrics = {"MRR": 0.0, "Hit@1": 0.0, "Hit@3": 0.0, "Hit@10": 0.0}
         total_samples = 0
         all_ranks = []
 
-        # Build a unified filter dictionary for both forward and inverse queries
         filter_dict = self._build_filter_dict(self.dataset_dir)
 
         with torch.no_grad():
@@ -321,10 +266,7 @@ class MMKGEngine(BaseEngine):
 
             pbar = tqdm(loader, desc=prefix, file=sys.stdout)
             for batch in pbar:
-                # OPTIMIZATION: Extract triples to CPU numpy array ONCE before GPU transfer.
-                # This completely eliminates slow CPU-GPU syncs (e.g., tensor.item()) in loops.
                 triples_cpu = batch["triples"].cpu().numpy()
-
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 triples = batch["triples"]
                 batch_size = triples.size(0)
@@ -332,12 +274,16 @@ class MMKGEngine(BaseEngine):
                 # ==========================================
                 # 1. Forward Prediction: (h, r, ?) -> predict tail
                 # ==========================================
-                _, fw_scores = self.model.retrieve(
-                    batch, top_k=10, device=self.device, return_scores=True
+                # Pass num_samples to evaluate multiple latent hypotheses
+                fw_scores = self.model.retrieve(
+                    batch,
+                    top_k=None,
+                    device=self.device,
+                    return_scores=True,
+                    num_samples=num_samples,
                 )
                 fw_targets = triples[:, 2]
 
-                # Fast list comprehension over CPU numpy arrays
                 fw_filters = [filter_dict.get((h, r), set()) for h, r, _ in triples_cpu]
                 fw_ranks = compute_filtered_ranks(fw_scores, fw_targets, fw_filters)
 
@@ -347,18 +293,21 @@ class MMKGEngine(BaseEngine):
                 inv_batch = batch.copy()
                 inv_triples = triples.clone()
 
-                # Swap head and tail, and shift the relation ID by num_relations
                 inv_triples[:, 0] = triples[:, 2]
                 inv_triples[:, 1] = triples[:, 1] + self.num_relations
                 inv_triples[:, 2] = triples[:, 0]
                 inv_batch["triples"] = inv_triples
 
-                _, inv_scores = self.model.retrieve(
-                    inv_batch, top_k=10, device=self.device, return_scores=True
+                # Pass num_samples to evaluate multiple latent hypotheses for inverse relations
+                inv_scores = self.model.retrieve(
+                    inv_batch,
+                    top_k=None,
+                    device=self.device,
+                    return_scores=True,
+                    num_samples=num_samples,
                 )
                 inv_targets = inv_triples[:, 2]
 
-                # Fast dictionary lookup using the pre-computed inverse keys
                 inv_filters = [
                     filter_dict.get((t, r + self.num_relations), set())
                     for _, r, t in triples_cpu
@@ -368,14 +317,10 @@ class MMKGEngine(BaseEngine):
                 # ==========================================
                 # 3. Update Metrics & Progress Bar
                 # ==========================================
-                # Concatenate ranks from both directions
                 batch_ranks = torch.cat([fw_ranks, inv_ranks], dim=0)
                 all_ranks.append(batch_ranks)
 
-                # Compute metrics for the current batch
                 batch_metrics = compute_all_metrics_filtered(batch_ranks)
-
-                # Each triple yields 2 evaluations (1 forward + 1 inverse)
                 current_samples = batch_size * 2
                 total_samples += current_samples
 
@@ -385,7 +330,6 @@ class MMKGEngine(BaseEngine):
                         continue
                     total_metrics[k] += batch_metrics[k] * current_samples
 
-                # Calculate running averages for tqdm display
                 current_avg = {k: v / total_samples for k, v in total_metrics.items()}
                 pbar.set_description(
                     f"{prefix}: "
@@ -395,7 +339,6 @@ class MMKGEngine(BaseEngine):
         # ==========================================
         # 4. Final Aggregation
         # ==========================================
-        # Compute final metrics from all collected ranks to avoid floating-point accumulation errors
         final_ranks = torch.cat(all_ranks, dim=0)
         final_metrics = compute_all_metrics_filtered(final_ranks)
 
@@ -457,6 +400,7 @@ class MMKGEngine(BaseEngine):
             )
             self.best_criteria = float("inf")
         if "epoch" in checkpoint:
+            self.current_epoch = checkpoint["epoch"]
             self.best_epoch = checkpoint["epoch"]
         else:
             self.logger.warning(
@@ -486,8 +430,8 @@ class MMKGEngine(BaseEngine):
         TERMINATE = False
         self.logger.info("Starting training...")
 
-        for epoch in range(self.max_epochs):
-            self.logger.info(f"Epoch {epoch + 1}/{self.max_epochs}")
+        for epoch in range(self.current_epoch, self.max_epochs):
+            self.logger.info(f"Epoch {epoch}/{self.max_epochs}")
 
             # Training
             train_start = time()
@@ -543,7 +487,7 @@ class MMKGEngine(BaseEngine):
                     "memory_allocated_mb": float(val_memory_allocated / (1024**2)),
                 },
             }
-            self._log_epoch_info(epoch=epoch + 1, epoch_log=epoch_log)
+            self._log_epoch_info(epoch=epoch, epoch_log=epoch_log)
 
             # Check for best model
             criteria = val_metrics.get("MRR", 0.0)
@@ -551,15 +495,15 @@ class MMKGEngine(BaseEngine):
 
             if is_best:
                 self.best_criteria = criteria
-                self.best_epoch = epoch + 1
+                self.best_epoch = epoch
                 self.logger.info(f"New best model! Val MRR: {criteria:.4f}")
 
             # Save checkpoint
-            if (epoch + 1) % self.save_freq == 0:
-                self.save_checkpoint(epoch + 1)
+            if (epoch) % self.save_freq == 0:
+                self.save_checkpoint(epoch)
 
             if is_best:
-                self.save_best_checkpoint(epoch + 1)
+                self.save_best_checkpoint(epoch)
 
             test_start = time()
             test_metrics = self.test()
@@ -582,7 +526,7 @@ class MMKGEngine(BaseEngine):
             f"Training completed. Best epoch: {self.best_epoch}, Best val loss: {self.best_criteria:.6f}"
         )
 
-        self.load_checkpoint(os.path.join(self.save_path, "best_model_checkpoint.pth"))
+        self.load_checkpoint(os.path.join(self.save_path, "best_model.pth"))
         self.logger.info("Evaluating best model on test sets...")
         test_start = time()
         test_metrics = self.test()

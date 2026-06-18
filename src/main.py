@@ -31,6 +31,8 @@ def set_seed(seed):
 )
 def main(cfg: DictConfig):
     # mp.set_start_method("spawn", force=True)
+    torch.set_float32_matmul_precision('high')
+    
     dataset_kwargs = cfg["dataset"]
     model_kwargs = cfg["model"]
     exp_kwargs = cfg["exp"]
@@ -52,7 +54,8 @@ def main(cfg: DictConfig):
     a = exp_kwargs["regularization"]
     loss_func = lambda x, y: lejepa_loss(x, y, a, regularization)
 
-    model: nn.Module = instantiate(model_kwargs).to(DEVICE)
+    model: KGJEPAModel = instantiate(model_kwargs).to(DEVICE)
+    model = torch.compile(model)
 
     log_folder = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     logger = get_logger(log_folder, log_file="training.log")
