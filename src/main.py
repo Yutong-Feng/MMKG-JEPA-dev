@@ -52,10 +52,10 @@ def main(cfg: DictConfig):
         univariate_test=univariate_test, num_slices=min(1024, model_kwargs["embed_dim"])
     ).to(DEVICE)
     a = exp_kwargs["regularization"]
-    loss_func = lambda x, y: lejepa_loss(x, y, a, regularization)
+    loss_func = lambda h, p, t: lejepa_loss(h, p, t, a=a, regularization=regularization)
 
     model: KGJEPAModel = instantiate(model_kwargs).to(DEVICE)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     log_folder = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     logger = get_logger(log_folder, log_file="training.log")

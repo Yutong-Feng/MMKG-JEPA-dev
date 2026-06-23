@@ -155,8 +155,8 @@ class MMKGEngine(BaseEngine):
             }
 
             # Forward pass
-            pred_embed, tail_ctx_embed = self.model(batch)
-            loss, sigreg = self.loss_func(pred_embed, tail_ctx_embed)
+            head_ctx_embed, pred_embed, tail_ctx_embed = self.model(batch)
+            loss, sigreg = self.loss_func(head_ctx_embed, pred_embed, tail_ctx_embed)
 
             if torch.isnan(loss):
                 self.logger.error("Training loss is NaN. Terminating.")

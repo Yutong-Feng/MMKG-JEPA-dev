@@ -857,6 +857,8 @@ class TrainKGLoader:
         num_workers: int = 0,
         prefetch_factor: int = 2,
         neighbor_index: Optional[NeighborIndex] = None,
+        *args,
+        **kwargs,
     ) -> None:
         _check_dataset(dataset)
         dataset_dir = os.path.join(data_root, dataset)
@@ -874,6 +876,7 @@ class TrainKGLoader:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             collate_fn=partial(
                 _collate_train,
                 neighbor_index=self.neighbor_index,
@@ -906,6 +909,8 @@ class EntityLoader:
         num_workers: int = 0,
         prefetch_factor: int = 2,
         neighbor_index: Optional[NeighborIndex] = None,
+        *args,
+        **kwargs,
     ) -> None:
         _check_dataset(dataset)
         dataset_dir = os.path.join(data_root, dataset)
@@ -920,6 +925,7 @@ class EntityLoader:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             collate_fn=partial(_collate_entity, neighbor_index=self.neighbor_index),
         )
 
@@ -947,6 +953,8 @@ class EvalLoader:
         split: str = "valid",
         num_workers: int = 0,
         prefetch_factor: int = 2,
+        *args,
+        **kwargs,
     ) -> None:
         _check_dataset(dataset)
         if split not in ("valid", "test"):
@@ -960,6 +968,7 @@ class EvalLoader:
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             collate_fn=_collate_eval,
         )
 

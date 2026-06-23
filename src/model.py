@@ -53,6 +53,7 @@ from typing import Dict, List, Optional, Tuple, Union, Callable
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.nn import functional as F
 
 from .gnn import build_gnn_layer
 from .norm import RMSNorm
@@ -79,6 +80,9 @@ class EntityEncoder(nn.Module):
         self.text_embed = nn.Embedding.from_pretrained(text_cb, freeze=True)
         self.vis_embed = nn.Embedding.from_pretrained(vis_cb, freeze=True)
 
+        self.modality_embed = nn.Parameter(torch.randn(32, embed_dim))
+        self.default_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+
         # Project each codebook's native dim to shared embed_dim
         self.text_proj = nn.Linear(768, embed_dim)
         self.vis_proj = nn.Linear(32, embed_dim)
@@ -96,6 +100,10 @@ class EntityEncoder(nn.Module):
             in_dim=embed_dim, nhead=nhead, dropout=dropout
         )
 
+        self.text_norm = RMSNorm(embed_dim)
+        self.vis_norm = RMSNorm(embed_dim)
+        self.out_norm = RMSNorm(embed_dim)
+
     def _encode_vis(self, vis_tokens: Tensor) -> tuple[Tensor, Tensor]:
         pad_mask = vis_tokens != -1  # [B, L_v]
         tokens = vis_tokens.masked_fill(~pad_mask, 0)
@@ -104,13 +112,13 @@ class EntityEncoder(nn.Module):
         valid_samples = pad_mask.any(dim=1)  # [B]
 
         if valid_samples.all():
-            return self.vis_encoder(emb, is_causal=False, mask=pad_mask), pad_mask
+            return self.vis_encoder(emb, loc_embed=True, mask=pad_mask), pad_mask
 
         out = torch.zeros_like(emb)  # [B, L_v, D]
         if valid_samples.any():
             out[valid_samples] = self.vis_encoder(
                 emb[valid_samples],
-                is_causal=False,
+                loc_embed=True,
                 mask=pad_mask[valid_samples],
             )
 
@@ -124,13 +132,13 @@ class EntityEncoder(nn.Module):
         valid_samples = pad_mask.any(dim=1)
 
         if valid_samples.all():
-            return self.text_encoder(emb, is_causal=False, mask=pad_mask), pad_mask
+            return self.text_encoder(emb, loc_embed=True, mask=pad_mask), pad_mask
 
         out = torch.zeros_like(emb)
         if valid_samples.any():
             out[valid_samples] = self.text_encoder(
                 emb[valid_samples],
-                is_causal=False,
+                loc_embed=True,
                 mask=pad_mask[valid_samples],
             )
 
@@ -154,24 +162,37 @@ class EntityEncoder(nn.Module):
 
         if text_tokens is not None:
             t_emb, t_mask = self._encode_text(text_tokens)
+            t_emb = self.text_norm(t_emb)
             ctx_parts.append(t_emb)
             mask_parts.append(t_mask)
 
         if vis_tokens is not None:
             v_emb, v_mask = self._encode_vis(vis_tokens)
+            v_emb = self.vis_norm(v_emb)
             ctx_parts.append(v_emb)
             mask_parts.append(v_mask)
 
         # 4. Concatenate modalities into a single context sequence
-        context = torch.cat(ctx_parts, dim=1)  # [B, L_t+L_v, D]
+        context = torch.cat(ctx_parts, dim=1) + self.modality_embed
         ctx_mask = torch.cat(mask_parts, dim=1)  # [B, L_t+L_v]
 
+        B = context.size(0)
+        default_tokens = self.default_token.expand(B, -1, -1)
+        default_mask = torch.ones(B, 1, dtype=torch.bool, device=context.device)
+
+        query = entity_emb.unsqueeze(1)  # [B, 1, D]
+        context = torch.cat([default_tokens, context], dim=1)
+        ctx_mask = torch.cat([default_mask, ctx_mask], dim=1)
 
         # 5. Cross-attention: entity query attends over multimodal context
-        query = entity_emb.unsqueeze(1)  # [B, 1, D]
-        fused = self.fusion_decoder(query, context, mask=ctx_mask)  # [B, 1, D]
+        fused = self.fusion_decoder(
+            query,
+            context,
+            mask=ctx_mask,
+            loc_embed=False,
+        )  # [B, 1, D]
 
-        return fused.squeeze(1)  # [B, D]
+        return self.out_norm(fused[:, 0, :])  # [B, D]
 
 
 # ===========================================================================
@@ -284,147 +305,79 @@ class NeighborhoodEncoder(nn.Module):
 
 class Predictor(nn.Module):
     """
-    Predicts the target entity context embedding conditioned on the source context,
-    the relation, and a sampled latent variable 'z'.
+    MLP predictor: maps a (head context, relation) pair to a predicted
+    tail-entity context embedding, conditioned on a sampled latent 'z'.
 
-    Architecture improvements:
-      - Uses Addition-based injection (instead of concatenation) for the latent variable,
-        allowing a learned, smooth semantic shift in the hidden space.
-      - Injects 'z' before the activation function to enable complex non-linear interactions.
-      - Standardized Dropout placement (Linear -> GELU -> Dropout).
+    For one (head, relation) pair we draw K independent latent vectors
+    'z ~ N(0, I)', so the predictor produces K diverse candidate embeddings.
+
+    Design:
+      - head context and relation are concatenated and encoded by a 'trunk'
+        MLP into an intermediate hidden representation;
+      - the latent 'z' is injected by ADDITION into that INTERMEDIATE hidden
+        layer (before an activation), NOT at the input, so the model first
+        builds a stable condition representation and the latent then perturbs
+        it deeper in the network;
+      - a 'head' MLP maps the perturbed hidden state back to embed_dim.
     """
 
     def __init__(
         self,
         embed_dim: int,
-        nhead: int,
-        dropout: float,
+        dropout: float = 0.0,
+        hidden_dim: Optional[int] = None,  # defaults to embed_dim // 2
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.positional_embedding = nn.Parameter(
-            torch.randn(2, embed_dim)
-        )  # Learnable positional embedding
-        self.query_norm = RMSNorm(embed_dim)
-        self.encoder = TransformerBlock(in_dim=embed_dim, nhead=nhead, dropout=dropout)
-        self.decoder = TransformerBlock(in_dim=embed_dim, nhead=nhead, dropout=dropout)
+        hidden_dim = hidden_dim or embed_dim // 2
+        self.hidden_dim = hidden_dim
+
+        # Trunk: encode the [head_ctx ; relation] condition into hidden space.
+        self.trunk = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Normalize the condition to zero-mean / unit-var BEFORE adding z,
+        self.cond_norm = nn.LayerNorm(hidden_dim)
+
+        # Head: applied AFTER the latent has been injected at the hidden layer.
+        self.head = nn.Sequential(
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+        self.out_norm = RMSNorm(embed_dim)  # normalize final output to unit scale
+
+        self.init_weights()
+
+    def init_weights(self):
+        # nn.init.zeros_(self.head[-1].weight)
+        # nn.init.zeros_(self.head[-1].bias)
+        pass
 
     def forward(
         self,
         head_ctx_embed: Tensor,  # [B, D]
         rel_embed: Tensor,  # [B, D]
-        num_samples: int = 8,  # K samples for diversity
-    ) -> Tensor:  # [B, K, D] or [B, D]
+        num_samples: int = 8,  # K latent samples for diversity
+    ) -> Tensor:  # [B, K, D]
         batch_size, device = head_ctx_embed.size(0), head_ctx_embed.device
 
-        # Process context -> [B, 2, hidden_dim]
-        ctx = torch.stack([head_ctx_embed, rel_embed], dim=1)
-        # ctx = ctx + self.positional_embedding.unsqueeze(0)
-        ctx = self.encoder(ctx)
+        # Encode the condition once, then broadcast over the K samples: [B, 1, H].
+        cond = self.trunk(torch.cat([head_ctx_embed, rel_embed], dim=-1))
+        cond = self.cond_norm(cond).unsqueeze(1)  # [B, 1, H], unit scale
 
-        # Sample and process latent variable 'z' -> [B, K, hidden_dim]
-        z = torch.randn(batch_size, num_samples, self.embed_dim, device=device)
+        # K latent samples projected into hidden space: [B, K, H].
+        z = torch.randn(batch_size, num_samples, self.hidden_dim, device=device)
 
-        query = self.query_norm(rel_embed.unsqueeze(1) + z)  # [B, K, D]
-
-        # Pass through decoder block -> [B, K, D]
-        pred_embed = self.decoder(query, ctx)
-
-        return pred_embed
-
-
-# class Predictor(nn.Module):
-#     """
-#     JEPA Predictor leveraging a continuous latent variable 'z' to handle
-#     one-to-many (1-to-N) relationships by mapping to a prediction manifold.
-#     """
-
-#     def __init__(
-#         self,
-#         embed_dim: int,
-#         rank: int,
-#         dropout: float,
-#         latent_dim: Optional[int] = None,
-#     ) -> None:
-#         super().__init__()
-#         self.embed_dim = embed_dim
-#         self.rank = rank
-#         self.latent_dim = (
-#             embed_dim if latent_dim is None else latent_dim
-#         )  # default latent dimension
-
-#         # Relation-conditioned LoRA transformations
-#         self.rel_to_A = nn.Linear(2 * embed_dim, embed_dim * rank)
-#         self.rel_to_B = nn.Linear(2 * embed_dim, rank * embed_dim)
-#         self.rel_to_b = nn.Linear(2 * embed_dim, embed_dim)
-#         self.out_norm = RMSNorm(embed_dim)
-
-#         self.scale = embed_dim**-0.5
-#         self.dropout = nn.Dropout(dropout)
-#         self._init_weights()
-
-#     def _init_weights(self):
-#         nn.init.kaiming_uniform_(self.rel_to_A.weight)
-#         nn.init.zeros_(self.rel_to_A.bias)
-#         nn.init.zeros_(self.rel_to_B.weight)
-#         nn.init.zeros_(self.rel_to_B.bias)
-#         nn.init.xavier_uniform_(self.rel_to_b.weight)
-#         nn.init.zeros_(self.rel_to_b.bias)
-#         # nn.init.xavier_uniform_(self.z_to_bottleneck.weight)
-#         # nn.init.zeros_(self.z_to_bottleneck.bias)
-
-#     def forward(
-#         self, head_ctx_embed: Tensor, rel_embed: Tensor, num_samples: int = 8
-#     ) -> Tensor:
-#         """
-#         Forward pass that samples 'num_samples' latent noises to generate multiple predictions.
-
-#         Parameters
-#         ----------
-#         head_ctx_embed : Tensor [B, D] - Head entity context embedding
-#         rel_embed      : Tensor [B, D] - Relation embedding
-#         num_samples    : int           - Number of Monte Carlo samples for latent z
-
-#         Returns
-#         -------
-#         Tensor [B, K, D] - K distinct predicted tail embeddings (where K = num_samples)
-#         """
-#         B, D = head_ctx_embed.shape
-#         r = self.rank
-#         K = num_samples
-
-#         # 1. Compute dynamic relation-specific LoRA weights
-#         A_flat = self.rel_to_A(
-#             torch.concat([head_ctx_embed, rel_embed], dim=-1)
-#         )  # [B, D*r]
-#         B_flat = self.rel_to_B(
-#             torch.concat([head_ctx_embed, rel_embed], dim=-1)
-#         )  # [B, r*D]
-#         b = self.rel_to_b(torch.concat([head_ctx_embed, rel_embed], dim=-1))  # [B, D]
-
-#         lora_A = A_flat.view(B, D, r)  # [B, D, r]
-#         lora_B = B_flat.view(B, r, D)  # [B, r, D]
-
-#         # 2. Project head context to bottleneck space
-#         Bh = torch.bmm(lora_B, head_ctx_embed.unsqueeze(-1)).squeeze(-1)  # [B, r]
-#         Bh = self.dropout(Bh)
-
-#         # 3. Sample latent variable z ~ N(0, I) and project to bottleneck space
-#         z = torch.randn(
-#             size=(B, K, self.rank), device=head_ctx_embed.device
-#         )  # [B, K, latent_dim]
-#         # z_feat = self.z_to_bottleneck(z)  # [B, K, r]
-
-#         # 4. Fuse deterministic context with stochastic latent features
-#         Bh_latent = Bh.unsqueeze(1) + z  # [B, K, r]
-
-#         # 5. Project back to embedding dimension and add relation bias
-#         ABh = torch.bmm(lora_A, Bh_latent.transpose(1, 2))  # [B, D, K]
-#         ABh = ABh.permute(0, 2, 1)  # [B, K, D]
-
-#         out = ABh + b.unsqueeze(1)  # [B, K, D]
-#         out = self.out_norm(out)
-#         return out
+        # Inject the latent at the intermediate hidden layer (before activation),
+        # then map back to embed_dim -> [B, K, D].
+        pred_embed = self.head(cond + z)
+        return self.out_norm(pred_embed)
 
 
 # ===========================================================================
@@ -512,7 +465,6 @@ class KGJEPAModel(nn.Module):
         # ── predictor ─────────────────────────────────────────────────
         self.predictor = Predictor(
             embed_dim=embed_dim,
-            nhead=nhead,
             dropout=pred_dropout,
         )
 
@@ -526,7 +478,7 @@ class KGJEPAModel(nn.Module):
     def forward(
         self,
         batch: Dict[str, object],
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Parameters
         ----------
@@ -537,6 +489,7 @@ class KGJEPAModel(nn.Module):
 
         Returns
         -------
+        head_ctx_embed : Tensor [B, D]  – true    head-entity context embedding
         pred_embed     : Tensor [B, D]  – predicted tail-entity context embedding
         tail_ctx_embed : Tensor [B, D]  – true    tail-entity context embedding
         """
@@ -564,7 +517,9 @@ class KGJEPAModel(nn.Module):
         id_to_idx[batch_entities] = torch.arange(len(batch_entities), device=device)
 
         def entity_lookup(ids: Tensor) -> Tensor:
-            # assert (id_to_idx[ids] >= 0).all(), f"OOB entity ids: {ids[id_to_idx[ids] < 0]}"
+            assert (
+                id_to_idx[ids] >= 0
+            ).all(), f"OOB entity ids: {ids[id_to_idx[ids] < 0]}"
             return fused_batch_embeds[id_to_idx[ids]]
 
         head_ids = triples[:, 0]  # [B]
@@ -593,7 +548,7 @@ class KGJEPAModel(nn.Module):
             edge_encoder=self.edge_encoder,
         )  # [B, D]
 
-        return pred_embed, tail_ctx_embed
+        return head_ctx_embed, pred_embed, tail_ctx_embed
 
     # ==================================================================
     # Inference helpers
@@ -644,7 +599,9 @@ class KGJEPAModel(nn.Module):
             id_to_idx[batch_entities] = torch.arange(len(batch_entities), device=device)
 
             def entity_lookup(ids: Tensor) -> Tensor:
-                # assert (id_to_idx[ids] >= 0).all(), f"OOB entity ids: {ids[id_to_idx[ids] < 0]}"
+                assert (
+                    id_to_idx[ids] >= 0
+                ).all(), f"OOB entity ids: {ids[id_to_idx[ids] < 0]}"
                 return fused_batch_embeds[id_to_idx[ids]]
 
             # --------------------------------------------------------
@@ -658,20 +615,28 @@ class KGJEPAModel(nn.Module):
             lut[entity_ids] = ctx_embed
 
         self._lut = lut
+        self._valid_mask = lut.abs().sum(dim=-1) > 0
+
+        # written = lut.abs().sum(dim=-1) > 0
+        # n_missing = (~written).sum().item()
+        # if n_missing > 0:
+        #     print(
+        #         f"[build_lut] WARNING: {n_missing}/{self.num_entities} entities are all-zero in LUT"
+        #     )
 
     @torch.no_grad()
     def retrieve(
         self,
         batch: Dict[str, object],
-        top_k: Optional[int] = None,  # Allow None for full-graph retrieval
+        top_k: Optional[int] = None,
         device: Optional[torch.device] = None,
         return_scores: bool = False,
-        num_samples: int = 16,  # Control Monte Carlo samples during inference
+        num_samples: int = 16,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
-        Retrieve candidate entity IDs by evaluating K latent samples
-        and routing via the minimum distance (maximum similarity) strategy.
-        If top_k is None, returns the sorted indices for all entities in the graph.
+        Retrieve candidate entity IDs by L2 distance, using min-distance routing
+        across the K latent samples (mirrors the training loss).
+        If top_k is None, returns the full ascending ranking over all entities.
         """
         if self._lut is None:
             raise RuntimeError(
@@ -684,52 +649,11 @@ class KGJEPAModel(nn.Module):
         head_ids = triples[:, 0]
         rel_ids = triples[:, 1]
 
-        head_ctx_embed = self._lut[head_ids]
-        rel_embed = self.edge_encoder(rel_ids)
+        head_ctx_embed = self._lut[head_ids]  # [B, D]
+        rel_embed = self.edge_encoder(rel_ids)  # [B, D]
 
-        # Predict K candidate embeddings using latent variable z: [B, K, D]
+        # K candidate predictions from the latent variable z: [B, K, D]
         pred_embed = self.predictor(head_ctx_embed, rel_embed, num_samples=num_samples)
-
-        # # Normalize both predictions and LUT for cosine similarity
-        # pred_norm = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)  # [B, K, D]
-        # lut_norm = torch.nn.functional.normalize(self._lut, p=2, dim=-1)    # [num_entities, D]
-
-        # # Pairwise dot product: [B, K, D] x [D, num_entities] -> [B, K, num_entities]
-        # cos_sim = torch.matmul(pred_norm, lut_norm.T)
-
-        # # Route via max similarity (min distance) across all K latent samples: [B, num_entities]
-        # mean_cos_sim = torch.mean(cos_sim, dim=1)
-
-        # # Convert to distance score (smaller means closer)
-        # dists = 1.0 - mean_cos_sim
-
-        # # Handle full-graph evaluation (Standard KGC protocol) vs Top-K search
-        # if top_k is None:
-        #     candidates = torch.argsort(dists, dim=1)
-        # else:
-        #     candidates = dists.topk(top_k, dim=1, largest=False).indices
-
-        # if return_scores:
-        #     return candidates, dists
-        # return candidates
-
-        # dists_all = torch.cdist(pred_embed, self._lut.unsqueeze(0), p=2)
-
-        # # Route via minimum distance across all K latent samples: [B, num_entities]
-        # # This finds the closest prediction among the K samples for each entity
-        # dists = torch.min(dists_all, dim=1).values
-
-        # # Handle full-graph evaluation (Standard KGC protocol) vs Top-K search
-        # if top_k is None:
-        #     # Default behavior of argsort is ascending (smallest distance first)
-        #     candidates = torch.argsort(dists, dim=1)
-        # else:
-        #     # Retrieve the indices of the smallest distances
-        #     candidates = dists.topk(top_k, dim=1, largest=False).indices
-
-        # if return_scores:
-        #     return candidates, dists
-        # return candidates
 
         # Pairwise dot product without normalization
         # pred_embed: [B, K, D], lut: [num_entities, D] -> Output: [B, K, num_entities]
@@ -740,29 +664,15 @@ class KGJEPAModel(nn.Module):
 
         # Convert similarity to a descending metric (or use descending=True in argsort)
         dists = -max_dot
+        dists = dists.masked_fill(~self._valid_mask.unsqueeze(0), float("inf"))
 
         if return_scores:
-            return dists
+            return dists  # [B, N], smaller = closer
+
+        # Full-graph ranking (KGC protocol) vs Top-K; smallest distance first.
+        if top_k is None:
+            candidates = torch.argsort(dists, dim=1)
         else:
-            # Handle full-graph evaluation (Standard KGC protocol) vs Top-K search
-            if top_k is None:
-                candidates = torch.argsort(dists, dim=1)
-            else:
-                candidates = dists.topk(top_k, dim=1, largest=False).indices
-            return candidates
+            candidates = dists.topk(top_k, dim=1, largest=False).indices
+        return candidates
 
-        # pred_embed_norm = torch.nn.functional.normalize(pred_embed, p=2, dim=-1)
-        # lut_norm = torch.nn.functional.normalize(self._lut, p=2, dim=-1)
-
-        # # Compute pairwise cosine similarity matrix [B, num_entities]
-        # cos_sim = torch.matmul(pred_embed_norm, lut_norm.T)
-
-        # # Convert similarity to distance (smaller is closer, range [0, 2])
-        # dists = 1.0 - cos_sim
-
-        # # Retrieve the closest Top-K candidates
-        # candidates = dists.topk(top_k, dim=1, largest=False).indices  # [B, top_k]
-
-        # if return_scores:
-        #     return candidates, dists
-        # return candidates

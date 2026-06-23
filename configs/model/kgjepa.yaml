@@ -5,7 +5,6 @@ num_relations: ${dataset.num_relations}
 
 embed_dim: 256
 nhead: 8
-layer_types: gat
-layer_kwargs: {"num_heads": 8}
-# layer_kwargs: {}
+layer_types: gcn
+layer_kwargs: {}
 pred_dropout: 0.1

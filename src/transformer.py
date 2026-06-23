@@ -68,14 +68,14 @@ class GateAttention(nn.Module):
         nn.init.xavier_uniform_(self.q.weight)
         nn.init.xavier_uniform_(self.kv.weight)
         nn.init.xavier_uniform_(self.gate.weight)
-        nn.init.xavier_uniform_(self.mixer.weight)
+        nn.init.zeros_(self.mixer.weight)
 
     def forward(
         self,
         target: torch.Tensor,
         memory: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        is_causal: bool = False,
+        loc_embed: bool = False,
     ) -> torch.Tensor:
 
         query = self.q(target)
@@ -86,10 +86,10 @@ class GateAttention(nn.Module):
         key_value = rearrange(key_value, "b l (h f) -> b h l f", h=self.nhead)
         key, value = key_value.chunk(2, dim=-1)
 
-        if is_causal:
+        if loc_embed:
             query, key = apply_rotary_pos_emb(query, key)
 
-        use_causal_flag = is_causal if mask is None else False
+        # use_causal_flag = loc_embed if mask is None else False
 
         if mask is not None:
             if mask.dim() == 2:
@@ -97,9 +97,7 @@ class GateAttention(nn.Module):
             elif mask.dim() == 3:
                 mask = mask.unsqueeze(1)
 
-        result = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=mask, is_causal=use_causal_flag
-        )
+        result = F.scaled_dot_product_attention(query, key, value, attn_mask=mask)
 
         result = rearrange(result, "b h l f -> b l (h f)")
 
@@ -141,10 +139,10 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         memory: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        is_causal: bool = False,
+        loc_embed: bool = False,
     ) -> torch.Tensor:
 
-        attn_out = self.attention(self.norm1(x), memory)
+        attn_out = self.attention(self.norm1(x), memory, mask=mask, loc_embed=loc_embed)
         x = attn_out + x
 
         x = self.ffn(self.norm2(x)) + x

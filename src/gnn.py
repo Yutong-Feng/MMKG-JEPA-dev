@@ -27,8 +27,8 @@ class GCNLayer(nn.Module):
         super().__init__()
         self.msg_proj = nn.Linear(2 * embed_dim, embed_dim)
         self.upd_proj = nn.Linear(2 * embed_dim, embed_dim)
-        self.norm = RMSNorm(embed_dim)
         self.act = nn.GELU()
+        self.norm = RMSNorm(embed_dim)
 
     def forward(
         self,
@@ -64,6 +64,7 @@ class GCNLayer(nn.Module):
         # --- update ---
         combined = torch.cat([center_embed, agg], dim=-1)  # [B, 2D]
         updated = self.upd_proj(combined)  # [B, D]
+        
         return self.norm(updated + center_embed)
 
 
@@ -95,8 +96,8 @@ class GATLayer(nn.Module):
         self.attn_vec = nn.Parameter(torch.Tensor(1, self.num_heads, 2 * self.head_dim))
 
         self.upd_proj = nn.Linear(2 * embed_dim, embed_dim)
-        self.norm = RMSNorm(embed_dim)
         self.act = nn.GELU()
+        self.norm = RMSNorm(embed_dim)
         
         self.init_weights()
         

@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.nn import functional as F
 
 from .gnn import build_gnn_layer
 from .norm import RMSNorm
@@ -197,51 +198,82 @@ class NeighborhoodEncoder(nn.Module):
 
 class Predictor(nn.Module):
     """
-    Predicts the target entity context embedding conditioned on the source context,
-    the relation, and a sampled latent variable 'z'.
+    MLP predictor: maps a (head context, relation) pair to a predicted
+    tail-entity context embedding, conditioned on a sampled latent 'z'.
 
-    Architecture improvements:
-      - Uses Addition-based injection (instead of concatenation) for the latent variable,
-        allowing a learned, smooth semantic shift in the hidden space.
-      - Injects 'z' before the activation function to enable complex non-linear interactions.
-      - Standardized Dropout placement (Linear -> GELU -> Dropout).
+    For one (head, relation) pair we draw K independent latent vectors
+    'z ~ N(0, I)', so the predictor produces K diverse candidate embeddings.
+
+    Design:
+      - head context and relation are concatenated and encoded by a 'trunk'
+        MLP into an intermediate hidden representation;
+      - the latent 'z' is injected by ADDITION into that INTERMEDIATE hidden
+        layer (before an activation), NOT at the input, so the model first
+        builds a stable condition representation and the latent then perturbs
+        it deeper in the network;
+      - a 'head' MLP maps the perturbed hidden state back to embed_dim.
     """
 
     def __init__(
         self,
         embed_dim: int,
-        nhead: int,
-        dropout: float,
+        dropout: float = 0.0,
+        hidden_dim: Optional[int] = None,  # defaults to embed_dim // 2
+        *args,
+        **kwargs
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
-        self.positional_embedding = nn.Parameter(torch.randn(2, embed_dim))  # Learnable positional embedding
-        self.query_norm = RMSNorm(embed_dim)
-        self.encoder = TransformerBlock(in_dim=embed_dim, nhead=nhead, dropout=dropout)
-        self.decoder = TransformerBlock(in_dim=embed_dim, nhead=nhead, dropout=dropout)
+        hidden_dim = hidden_dim or embed_dim // 2
+        self.hidden_dim = hidden_dim
+
+        # Trunk: encode the [head_ctx ; relation] condition into hidden space.
+        self.trunk = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
+        # Normalize the condition to zero-mean / unit-var BEFORE adding z,
+        self.cond_norm = nn.LayerNorm(hidden_dim)
+
+        # Head: applied AFTER the latent has been injected at the hidden layer.
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        
+        self.output_norm = RMSNorm(embed_dim)
+        
+        self.init_weights()
+        
+    def init_weights(self):
+        # nn.init.zeros_(self.head[-1].weight)
+        # nn.init.zeros_(self.head[-1].bias)
+        pass
 
     def forward(
         self,
         head_ctx_embed: Tensor,  # [B, D]
         rel_embed: Tensor,  # [B, D]
-        num_samples: int = 8,  # K samples for diversity
-    ) -> Tensor:  # [B, K, D] or [B, D]
+        num_samples: int = 8,  # K latent samples for diversity
+    ) -> Tensor:  # [B, K, D]
         batch_size, device = head_ctx_embed.size(0), head_ctx_embed.device
 
-        # Process context -> [B, 2, hidden_dim]
-        ctx = torch.stack([head_ctx_embed, rel_embed], dim=1)
-        # ctx = ctx + self.positional_embedding.unsqueeze(0)
-        ctx = self.encoder(ctx)
+        # Encode the condition once, then broadcast over the K samples: [B, 1, H].
+        cond = self.trunk(torch.cat([head_ctx_embed, rel_embed], dim=-1))
+        cond = self.cond_norm(cond).unsqueeze(1)  # [B, 1, H], unit scale
 
-        # Sample and process latent variable 'z' -> [B, K, hidden_dim]
-        z = torch.randn(batch_size, num_samples, self.embed_dim, device=device)
+        # K latent samples projected into hidden space: [B, K, H].
+        z = torch.randn(batch_size, num_samples, self.hidden_dim, device=device)
 
-        query = self.query_norm(rel_embed.unsqueeze(1) + z)  # [B, K, D]
-
-        # Pass through decoder block -> [B, K, D]
-        pred_embed = self.decoder(query, ctx)  
-
-        return pred_embed
+        # Inject the latent at the intermediate hidden layer (before activation),
+        # then map back to embed_dim -> [B, K, D].
+        pred_embed = self.head(cond + z)
+        return self.output_norm(pred_embed)
 
 
 # ===========================================================================
@@ -386,7 +418,7 @@ class KGJEPAModel(nn.Module):
             edge_encoder=self.edge_encoder,
         )  # [B, D]
 
-        return pred_embed, tail_ctx_embed
+        return head_ctx_embed, pred_embed, tail_ctx_embed
 
     # ==================================================================
     # Inference helpers
@@ -428,6 +460,7 @@ class KGJEPAModel(nn.Module):
             lut[entity_ids] = ctx_embed
 
         self._lut = lut  # [num_entities, D]
+        self._valid_mask = lut.abs().sum(dim=-1) > 0
 
     @torch.no_grad()
     def retrieve(
@@ -463,11 +496,7 @@ class KGJEPAModel(nn.Module):
         # Pairwise dot product without normalization
         # pred_embed: [B, K, D], lut: [num_entities, D] -> Output: [B, K, num_entities]
         dot_product = torch.matmul(pred_embed, self._lut.T)
-
-        # Route via maximum dot product (higher is more similar)
         max_dot = torch.max(dot_product, dim=1).values
-
-        # Convert similarity to a descending metric (or use descending=True in argsort)
         dists = -max_dot
 
         if return_scores:
